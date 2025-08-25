@@ -2,7 +2,7 @@ defaults:
   - default_dataset.yaml
 
 exp_name: single_tv
-img_size: 100
+img_size: 140
 num_workers: 8
 seed_value: 42
 accum_steps: 2
