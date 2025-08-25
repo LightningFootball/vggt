@@ -70,9 +70,9 @@ def main():
     mem_opt = torch.cuda.max_memory_allocated() if device.type == "cuda" else None
 
     print("Equality checks:")
-    print("  pose_enc last equal:", torch.allclose(cam_full[-1], cam_opt[-1], rtol=1e-4, atol=1e-5).item())
-    print("  depth pred equal:", torch.allclose(d_full_pred, d_opt_pred, rtol=1e-4, atol=1e-5).item())
-    print("  depth conf equal:", torch.allclose(d_full_conf, d_opt_conf, rtol=1e-4, atol=1e-5).item())
+    print("  pose_enc last equal:", bool(torch.allclose(cam_full[-1], cam_opt[-1], rtol=1e-4, atol=1e-5)))
+    print("  depth pred equal:", bool(torch.allclose(d_full_pred, d_opt_pred, rtol=1e-4, atol=1e-5)))
+    print("  depth conf equal:", bool(torch.allclose(d_full_conf, d_opt_conf, rtol=1e-4, atol=1e-5)))
     print()
 
     print(f"Timings (s): full={t1 - t0:.3f}, optimized={t3 - t2:.3f}")
@@ -84,4 +84,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

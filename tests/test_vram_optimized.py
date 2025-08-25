@@ -15,12 +15,13 @@ def test_selected_view_indexing_and_shape():
     embed_dim = 64
     depth = 8
     num_heads = 8
+    patch_size = 16  # ensure H and W are multiples of patch
     images = torch.rand(B, S, 3, H, W)
 
     # Baseline aggregator (stores all layers)
     agg_full = Aggregator(
         img_size=H,
-        patch_size=14,
+        patch_size=patch_size,
         embed_dim=embed_dim,
         depth=depth,
         num_heads=num_heads,
@@ -31,7 +32,7 @@ def test_selected_view_indexing_and_shape():
     selected_idx = [1, 3, 5, 7]
     agg_opt = AggregatorVramOptimized(
         img_size=H,
-        patch_size=14,
+        patch_size=patch_size,
         embed_dim=embed_dim,
         depth=depth,
         num_heads=num_heads,
@@ -111,6 +112,7 @@ def test_heads_numerical_equivalence():
         features=64,
         out_channels=[64, 64, 64, 64],
         intermediate_layer_idx=sel,  # absolute indices
+        patch_size=patch_size,
         pos_embed=False,
     ).eval()
 
@@ -119,4 +121,3 @@ def test_heads_numerical_equivalence():
 
     assert torch.allclose(d_full_pred, d_opt_pred, rtol=1e-4, atol=1e-5)
     assert torch.allclose(d_full_conf, d_opt_conf, rtol=1e-4, atol=1e-5)
-
