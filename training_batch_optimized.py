@@ -45,13 +45,9 @@ def main():
     bf = int(args.batch_frames)
     # train
     cfg.data.train.max_img_per_gpu = bf
-    if "common_config" in cfg.data.train and cfg.data.train.common_config is not None:
-        cfg.data.train.common_config.max_img_per_gpu = bf
     # val
     if "val" in cfg.data and cfg.data.val is not None:
         cfg.data.val.max_img_per_gpu = bf
-        if "common_config" in cfg.data.val and cfg.data.val.common_config is not None:
-            cfg.data.val.common_config.max_img_per_gpu = bf
 
     # Logging/exp isolation
     base_exp = args.exp_name or cfg.exp_name
