@@ -1,11 +1,11 @@
 defaults:
   - default_dataset.yaml
 
-exp_name: exp001
+exp_name: single_tv
 img_size: 518
 num_workers: 8
 seed_value: 42
-accum_steps: 2    # We did not use gradient accumulation in our training, while if you suffer from OOM, you can try to use it.
+accum_steps: 2
 patch_size: 14
 val_epoch_freq: 5
 max_img_per_gpu: 48
@@ -15,7 +15,6 @@ limit_val_batches: 400
 
 
 data:
-  # The code for data still looks too complicated. I should refactor this again (do I have time?...)
   train:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
     num_workers: ${num_workers}
@@ -23,7 +22,8 @@ data:
     common_config:
       img_size: ${img_size}
       patch_size: ${patch_size}
-      debug: True
+      # NOTE: Must be False to allow non-apple categories like 'tv'.
+      debug: False
       repeat_batch: False
     dataset:
       _target_: data.composed_dataset.ComposedDataset
@@ -32,6 +32,8 @@ data:
           split: train
           CO3D_DIR: /workspace/datasets/CO3D
           CO3D_ANNOTATION_DIR: /workspace/datasets/CO3D_ANNOTATION
+          # Optional: relax for small per-sequence frame counts
+          min_num_images: 8
   val:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
     num_workers: ${num_workers}
@@ -39,14 +41,16 @@ data:
     common_config:
       img_size: ${img_size}
       patch_size: ${patch_size}
-      debug: True
+      # NOTE: keep False so validation also uses 'tv' only
+      debug: False
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
         - _target_: data.datasets.co3d.Co3dDataset
           split: test
           CO3D_DIR: /workspace/datasets/CO3D
-          CO3D_ANNOTATION_DIR: /workspace/datasets/CO3D_ANNOTATIONA
+          CO3D_ANNOTATION_DIR: /workspace/datasets/CO3D_ANNOTATION
+          min_num_images: 8
 
 
 logging:
@@ -82,11 +86,11 @@ logging:
         - loss_grad_depth
 
 
-
 checkpoint:
   save_dir: logs/${exp_name}/ckpts
   save_freq: 5
-  resume_checkpoint_path: /YOUR/PATH/TO/CKPT
+  # Avoid failing on nonexistent placeholder path; set to null by default.
+  resume_checkpoint_path: null
   strict: False
 
 
@@ -94,20 +98,12 @@ loss:
   _target_: loss.MultitaskLoss
   camera: 
     weight: 5.0
-    loss_type: "l1" # The paper uses smooth l1 loss, but we found l1 loss is more stable than smooth l1 and l2 loss.  
+    loss_type: "l1"
   depth:
     weight: 1.0
     gradient_loss_fn: "grad" 
     valid_range: 0.98
   point: null
-  # If you want to enable point, use the following config
-  # point: 
-  #   weight: 1.0
-  #   gradient_loss_fn: "normal" 
-  #   valid_range: 0.98
-  track: null   
-
-
 
 
 optim:
@@ -119,7 +115,7 @@ optim:
     weight_decay: 0.05
 
   frozen_module_names:
-      - "*aggregator*"  # example, freeze the aggregator
+      - "*aggregator*"
 
   amp:
     enabled: True
@@ -128,13 +124,13 @@ optim:
     _target_: train_utils.gradient_clip.GradientClipper
     configs:
       - module_name: ["aggregator"]
-        max_norm: 1.0   # feel free to reduce this if you see instabilities
+        max_norm: 1.0
         norm_type: 2
       - module_name: ["depth"]
-        max_norm: 1.0   # feel free to reduce this if you see instabilities
+        max_norm: 1.0
         norm_type: 2
       - module_name: ["camera"]
-        max_norm: 1.0   # feel free to reduce this if you see instabilities
+        max_norm: 1.0
         norm_type: 2
   options:
     lr:
@@ -155,8 +151,6 @@ optim:
           value: 0.05
 
 
-
-
 max_epochs: 20
 
 model:
@@ -168,16 +162,16 @@ model:
 
 
 distributed:
-  # check https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html for options
   backend: nccl
   comms_dtype: None
   find_unused_parameters: False
   timeout_mins: 30
-  gradient_as_bucket_view: True  # Less memory used
+  gradient_as_bucket_view: True
   bucket_cap_mb: 25
   broadcast_buffers: True
 
 cuda:
-    cudnn_deterministic: False
-    cudnn_benchmark: False
-    allow_tf32: True
+  cudnn_deterministic: False
+  cudnn_benchmark: False
+  allow_tf32: True
+
