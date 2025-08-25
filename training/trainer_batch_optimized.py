@@ -1,7 +1,7 @@
 import os
 import json
 import time
-import logging
+import logging as pylog
 import math
 import contextlib
 from typing import Any, Dict, List, Mapping, Optional
@@ -93,7 +93,7 @@ class TrainerBatchOptimized(BaseTrainer):
             safe_makedirs(self.jsonl_dir)
             self.jsonl_path = os.path.join(self.jsonl_dir, f"metrics_{self.run_id}.jsonl")
             self._jsonl_fh = open(self.jsonl_path, "w", buffering=1)
-            logging.info(f"JSONL metrics will be written to: {self.jsonl_path}")
+            pylog.info(f"JSONL metrics will be written to: {self.jsonl_path}")
 
         # Accumulators for summaries
         self._train_records: List[Dict[str, Any]] = []
@@ -133,7 +133,7 @@ class TrainerBatchOptimized(BaseTrainer):
         try:
             self._jsonl_fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception as e:
-            logging.warning(f"Failed to write JSONL record: {e}")
+            pylog.warning(f"Failed to write JSONL record: {e}")
 
     def _collect_scalar_values(self, phase: str, loss_meters: Dict[str, AverageMeter]) -> Dict[str, float]:
         # Reads current `val` from AverageMeters conforming to logging.scalar_keys_to_log
@@ -407,7 +407,7 @@ class TrainerBatchOptimized(BaseTrainer):
                 for optim in self.optims:
                     optim.step_schedulers(self.where)
             else:
-                logging.warning(
+                pylog.warning(
                     f"Skipping scheduler update since the training is at the end, i.e, {self.where} of [0,1]."
                 )
 
@@ -541,7 +541,7 @@ class TrainerBatchOptimized(BaseTrainer):
                 summary_payload["val"] = self._aggregate(self._val_records, 0)
             with open(summary_path, "w") as f:
                 json.dump(summary_payload, f, ensure_ascii=False, indent=2)
-            logging.info(f"Summary written to: {summary_path}")
+            pylog.info(f"Summary written to: {summary_path}")
             return summary_path
         return None
 
@@ -551,4 +551,3 @@ class TrainerBatchOptimized(BaseTrainer):
                 self._jsonl_fh.close()
         except Exception:
             pass
-
