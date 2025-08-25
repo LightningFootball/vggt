@@ -49,6 +49,34 @@ class Aggregator(nn.Module):
         init_values (float): Init scale for layer scale.
     """
 
+    """
+    Aggregator（聚合器）在输入的帧上应用交替注意力（alternating-attention），
+    具体方法见论文《VGGT: Visual Geometry Grounded Transformer》。
+
+    请记得在训练时调用 model.train()，
+    以启用梯度检查点（gradient checkpointing）来减少显存使用。
+
+    参数说明:
+        img_size (int): 输入图像的尺寸（像素）。
+        patch_size (int): PatchEmbed 中每个 patch 的大小。
+        embed_dim (int): token 嵌入的维度。
+        depth (int): 块（block）的数量。
+        num_heads (int): 注意力头（attention heads）的数量。
+        mlp_ratio (float): MLP 隐藏层维度与嵌入维度的比率。
+        num_register_tokens (int): register token 的数量。
+        block_fn (nn.Module): 用于注意力的块类型（默认是 Block）。
+        qkv_bias (bool): 是否在 QKV 投影中使用偏置项。
+        proj_bias (bool): 是否在输出投影中使用偏置项。
+        ffn_bias (bool): 是否在 MLP 层中使用偏置项。
+        patch_embed (str): patch 嵌入的类型，例如 "conv" 或 "dinov2_vitl14_reg"。
+        aa_order (list[str]): 交替注意力的顺序，例如 ["frame", "global"]。
+        aa_block_size (int): 在切换注意力类型之前，每种注意力分组包含的块数。不需要时设为 1。
+        qk_norm (bool): 是否对 QK 应用归一化。
+        rope_freq (int): 旋转位置编码（rotary embedding）的基频。设为 -1 表示禁用。
+        init_values (float): layer scale 的初始化缩放值。
+    """
+
+
     def __init__(
         self,
         img_size=518,
@@ -74,9 +102,11 @@ class Aggregator(nn.Module):
         self.__build_patch_embed__(patch_embed, img_size, patch_size, num_register_tokens, embed_dim=embed_dim)
 
         # Initialize rotary position embedding if frequency > 0
+        # 如果频率大于 0，则初始化旋转位置嵌入（rotary position embedding）
         self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
         self.position_getter = PositionGetter() if self.rope is not None else None
 
+        # 初始化帧块（frame blocks）
         self.frame_blocks = nn.ModuleList(
             [
                 block_fn(
@@ -90,10 +120,13 @@ class Aggregator(nn.Module):
                     qk_norm=qk_norm,
                     rope=self.rope,
                 )
+                # 初始化 depth 个帧块
+                # Python 列表推导式
                 for _ in range(depth)
             ]
         )
 
+        # 初始化全局块（global blocks）
         self.global_blocks = nn.ModuleList(
             [
                 block_fn(
@@ -117,27 +150,36 @@ class Aggregator(nn.Module):
         self.aa_block_size = aa_block_size
 
         # Validate that depth is divisible by aa_block_size
+        # 验证 depth 是否能被 aa_block_size 整除
+        # 确保 帧内自注意力和全局自注意力两种模式 数量相等
         if self.depth % self.aa_block_size != 0:
             raise ValueError(f"depth ({depth}) must be divisible by aa_block_size ({aa_block_size})")
 
+        # 计算交替注意力（aa）块的数量
         self.aa_block_num = self.depth // self.aa_block_size
 
         # Note: We have two camera tokens, one for the first frame and one for the rest
         # The same applies for register tokens
+        # 注意：我们有两个相机 token，一个用于第一帧，一个用于其余帧
+        # 寄存 token 的情况相同
         self.camera_token = nn.Parameter(torch.randn(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.randn(1, 2, num_register_tokens, embed_dim))
 
         # The patch tokens start after the camera and register tokens
+        # 块 token 从相机和寄存 token 之后开始
         self.patch_start_idx = 1 + num_register_tokens
 
         # Initialize parameters with small values
+        # 使用较小标准差初始化 camera_token 和 register_token
         nn.init.normal_(self.camera_token, std=1e-6)
         nn.init.normal_(self.register_token, std=1e-6)
 
         # Register normalization constants as buffers
+        # 把归一化用的常量保存为 buffer
         for name, value in (("_resnet_mean", _RESNET_MEAN), ("_resnet_std", _RESNET_STD)):
             self.register_buffer(name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False)
 
+        # 使用 非重入式 backward
         self.use_reentrant = False # hardcoded to False
 
     def __build_patch_embed__(
@@ -155,6 +197,10 @@ class Aggregator(nn.Module):
         """
         Build the patch embed layer. If 'conv', we use a
         simple PatchEmbed conv layer. Otherwise, we use a vision transformer.
+        """
+        """
+        构建 patch 嵌入层。如果 patch_embed 为 "conv"，则使用简单的 PatchEmbed 卷积层。
+        否则，使用 dinov2 的 vision transformer。
         """
 
         if "conv" in patch_embed:
@@ -191,6 +237,20 @@ class Aggregator(nn.Module):
             (list[torch.Tensor], int):
                 The list of outputs from the attention blocks,
                 and the patch_start_idx indicating where patch tokens begin.
+        """
+        """
+        参数:
+            images (torch.Tensor): 输入图像，形状为 [B, S, 3, H, W]，取值范围 [0, 1]。
+                B: 批大小 (batch size)，
+                S: 序列长度 (sequence length)，
+                3: RGB 通道数，
+                H: 图像高度，
+                W: 图像宽度。
+
+        返回:
+            (list[torch.Tensor], int):
+                一个张量列表，包含各个注意力块 (attention blocks) 的输出，
+                以及一个整数 patch_start_idx，表示 patch tokens 开始的位置。
         """
         B, S, C_in, H, W = images.shape
 
