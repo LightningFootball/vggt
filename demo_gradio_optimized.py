@@ -339,4 +339,4 @@ with gr.Blocks(theme=theme) as demo:
         e(fn=update_gallery_on_upload, inputs=[input_video, input_images], outputs=[image_gallery, target_dir_output, image_gallery, log_output])
 
 demo.queue(max_size=32)
-demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
