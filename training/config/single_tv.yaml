@@ -22,16 +22,17 @@ data:
     common_config:
       img_size: ${img_size}
       patch_size: ${patch_size}
-      # NOTE: Must be False to allow non-apple categories like 'tv'.
-      debug: False
+      # Use debug=True is fine; Co3dDatasetSingle ignores apple restriction
+      debug: True
       repeat_batch: False
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-        - _target_: data.datasets.co3d.Co3dDataset
+        - _target_: data.datasets.co3d_single.Co3dDatasetSingle
           split: train
           CO3D_DIR: /workspace/datasets/CO3D
           CO3D_ANNOTATION_DIR: /workspace/datasets/CO3D_ANNOTATION
+          only_category: tv
           # Optional: relax for small per-sequence frame counts
           min_num_images: 8
   val:
@@ -41,15 +42,16 @@ data:
     common_config:
       img_size: ${img_size}
       patch_size: ${patch_size}
-      # NOTE: keep False so validation also uses 'tv' only
-      debug: False
+      # Keep debug True; single-category dataset will still use tv only
+      debug: True
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-        - _target_: data.datasets.co3d.Co3dDataset
+        - _target_: data.datasets.co3d_single.Co3dDatasetSingle
           split: test
           CO3D_DIR: /workspace/datasets/CO3D
           CO3D_ANNOTATION_DIR: /workspace/datasets/CO3D_ANNOTATION
+          only_category: tv
           min_num_images: 8
 
 
@@ -174,4 +176,3 @@ cuda:
   cudnn_deterministic: False
   cudnn_benchmark: False
   allow_tf32: True
-
