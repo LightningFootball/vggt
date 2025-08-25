@@ -88,6 +88,7 @@ checkpoint:
   save_freq: 5
   resume_checkpoint_path: /YOUR/PATH/TO/CKPT
   strict: False
+  enabled: true
 
 
 loss:
