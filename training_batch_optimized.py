@@ -36,10 +36,10 @@ def main():
     cfg.limit_train_batches = max(0, args.steps - 1)
     cfg.limit_val_batches = int(args.val_batches)
 
-    # Inject step-based val and warmup handling into trainer
-    cfg.val_step_freq = int(args.val_every)
-    cfg.warmup_skip_steps = int(args.warmup_skip)
-    cfg.jsonl_dir = "report/baselines"
+    # Extra knobs kept outside cfg; passed directly to TrainerBatchOptimized
+    val_step_freq = int(args.val_every)
+    warmup_skip_steps = int(args.warmup_skip)
+    jsonl_dir = "report/baselines"
 
     # Batch-frames override (train/val)
     bf = int(args.batch_frames)
@@ -71,7 +71,12 @@ def main():
     print(OmegaConf.to_yaml(cfg))
 
     # Run training
-    trainer = TrainerBatchOptimized(**cfg)
+    trainer = TrainerBatchOptimized(
+        **cfg,
+        val_step_freq=val_step_freq,
+        warmup_skip_steps=warmup_skip_steps,
+        jsonl_dir=jsonl_dir,
+    )
     trainer.run()
     trainer.write_summaries()
 
