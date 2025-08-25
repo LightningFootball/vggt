@@ -31,7 +31,7 @@ data:
         - _target_: data.datasets.co3d.Co3dDataset
           split: train
           CO3D_DIR: /workspace/datasets/CO3D
-          CO3D_ANNOTATION_DIR: /workspace/datasets/CO3D_ANNOTATION
+          CO3D_ANNOTATION_DIR: /workspace/datasets/CO3D
   val:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
     num_workers: ${num_workers}
@@ -46,7 +46,7 @@ data:
         - _target_: data.datasets.co3d.Co3dDataset
           split: test
           CO3D_DIR: /workspace/datasets/CO3D
-          CO3D_ANNOTATION_DIR: /workspace/datasets/CO3D_ANNOTATION
+          CO3D_ANNOTATION_DIR: /workspace/datasets/CO3D
 
 
 logging:
