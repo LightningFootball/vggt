@@ -437,4 +437,4 @@ with gr.Blocks(theme=theme) as demo:
     )
 
 demo.queue(max_size=32)
-demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
+demo.launch(server_name="0.0.0.0", server_port=8080, share=False)
