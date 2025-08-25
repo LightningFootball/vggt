@@ -362,9 +362,22 @@ def main():
     print("Running inference...")
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
+    # Debug: timing + peak CUDA memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
             predictions = model(images)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        peak_mem = torch.cuda.max_memory_allocated()
+    t1 = time.perf_counter()
+    print(f"[Debug] Inference time: {t1 - t0:.3f}s")
+    if torch.cuda.is_available():
+        print(f"[Debug] Peak CUDA memory: {peak_mem/1e6:.2f} MB")
 
     print("Converting pose encoding to extrinsic and intrinsic matrices...")
     extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])

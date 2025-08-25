@@ -326,17 +326,115 @@ with gr.Blocks(theme=theme) as demo:
                 elem_id="my_radio",
             )
 
-    reconstruct_button.click(
-        fn=gradio_demo,
-        inputs=[target_dir_output, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode],
-        outputs=[glb_viewer, log_output, frame_filter],
+    # ---------------------- Examples section ----------------------
+    great_wall_video = "examples/videos/great_wall.mp4"
+    colosseum_video = "examples/videos/Colosseum.mp4"
+    room_video = "examples/videos/room.mp4"
+    kitchen_video = "examples/videos/kitchen.mp4"
+    fern_video = "examples/videos/fern.mp4"
+    single_cartoon_video = "examples/videos/single_cartoon.mp4"
+    single_oil_painting_video = "examples/videos/single_oil_painting.mp4"
+    pyramid_video = "examples/videos/pyramid.mp4"
+
+    examples = [
+        [colosseum_video, "22", None, 20.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
+        [pyramid_video, "30", None, 35.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
+        [single_cartoon_video, "1", None, 15.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
+        [single_oil_painting_video, "1", None, 20.0, False, False, True, True, "Depthmap and Camera Branch", "True"],
+        [room_video, "8", None, 5.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
+        [kitchen_video, "25", None, 50.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
+        [fern_video, "20", None, 45.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
+    ]
+
+    def example_pipeline(
+        input_video,
+        num_images_str,
+        input_images,
+        conf_thres,
+        mask_black_bg,
+        mask_white_bg,
+        show_cam,
+        mask_sky,
+        prediction_mode,
+        is_example_str,
+    ):
+        target_dir, image_paths = handle_uploads(input_video, input_images)
+        frame_filter_val = "All"
+        glbfile, log_msg, dropdown = gradio_demo(
+            target_dir, conf_thres, frame_filter_val, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode
+        )
+        return glbfile, log_msg, target_dir, dropdown, image_paths
+
+    gr.Markdown("Click any row to load an example.")
+    gr.Examples(
+        examples=examples,
+        inputs=[
+            input_video,
+            num_images,
+            input_images,
+            conf_thres,
+            mask_black_bg,
+            mask_white_bg,
+            show_cam,
+            mask_sky,
+            prediction_mode,
+            is_example,
+        ],
+        outputs=[glb_viewer, log_output, target_dir_output, frame_filter, image_gallery],
+        fn=example_pipeline,
+        cache_examples=False,
+        examples_per_page=50,
     )
 
-    clear_button.click(fn=clear_fields, outputs=[glb_viewer])
+    # Submit button chain similar to original
+    reconstruct_button.click(fn=clear_fields, inputs=[], outputs=[glb_viewer]).then(
+        fn=update_log, inputs=[], outputs=[log_output]
+    ).then(
+        fn=gradio_demo,
+        inputs=[
+            target_dir_output,
+            conf_thres,
+            frame_filter,
+            mask_black_bg,
+            mask_white_bg,
+            show_cam,
+            mask_sky,
+            prediction_mode,
+        ],
+        outputs=[glb_viewer, log_output, frame_filter],
+    ).then(
+        fn=lambda: "False", inputs=[], outputs=[is_example]
+    )
 
-    upload_gallery_event = [input_video.change, input_images.change]
-    for e in upload_gallery_event:
-        e(fn=update_gallery_on_upload, inputs=[input_video, input_images], outputs=[image_gallery, target_dir_output, image_gallery, log_output])
+    # Real-time visualization updates
+    for comp in [conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode]:
+        comp.change(
+            update_visualization,
+            [
+                target_dir_output,
+                conf_thres,
+                frame_filter,
+                mask_black_bg,
+                mask_white_bg,
+                show_cam,
+                mask_sky,
+                prediction_mode,
+                is_example,
+            ],
+            [glb_viewer, log_output],
+        )
+
+    # Auto-update gallery on upload
+    input_video.change(
+        fn=update_gallery_on_upload,
+        inputs=[input_video, input_images],
+        outputs=[glb_viewer, target_dir_output, image_gallery, log_output],
+    )
+    input_images.change(
+        fn=update_gallery_on_upload,
+        inputs=[input_video, input_images],
+        outputs=[glb_viewer, target_dir_output, image_gallery, log_output],
+    )
 
 demo.queue(max_size=32)
 demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
