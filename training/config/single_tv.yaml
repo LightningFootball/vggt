@@ -2,7 +2,7 @@ defaults:
   - default_dataset.yaml
 
 exp_name: single_tv
-img_size: 518
+img_size: 100
 num_workers: 8
 seed_value: 42
 accum_steps: 2
@@ -24,6 +24,7 @@ data:
       patch_size: ${patch_size}
       # Use debug=True is fine; Co3dDatasetSingle ignores apple restriction
       debug: True
+      img_nums: [2, 6]
       repeat_batch: False
     dataset:
       _target_: data.composed_dataset.ComposedDataset
@@ -44,6 +45,7 @@ data:
       patch_size: ${patch_size}
       # Keep debug True; single-category dataset will still use tv only
       debug: True
+      img_nums: [2, 6]
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
