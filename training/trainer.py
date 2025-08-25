@@ -312,6 +312,11 @@ class Trainer:
             checkpoint_names: A list of names for the checkpoint file (e.g., "checkpoint_latest").
                               If None, saves "checkpoint" and "checkpoint_{epoch}" on frequency.
         """
+        # Allow disabling checkpoints via config: checkpoint.enabled: False
+        if getattr(self.checkpoint_conf, "enabled", True) is False:
+            logging.info("Checkpoint saving is disabled by config; skipping save.")
+            return
+
         checkpoint_folder = self.checkpoint_conf.save_dir
         safe_makedirs(checkpoint_folder)
         if checkpoint_names is None:
@@ -865,4 +870,3 @@ def get_chunk_from_data(data: Any, chunk_id: int, num_chunks: int) -> Any:
         return [get_chunk_from_data(value, chunk_id, num_chunks) for value in data]
     else:
         return data
-

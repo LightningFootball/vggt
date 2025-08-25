@@ -58,6 +58,8 @@ def main():
         cfg.checkpoint.resume_checkpoint_path = None
         # Keep checkpoint dir under the same exp folder
         cfg.checkpoint.save_dir = os.path.join("logs", cfg.exp_name, "ckpts")
+        # Disable heavy checkpoint files for this optimized batch run
+        cfg.checkpoint.enabled = False
 
     # Optional: make epoch-driven val effectively disabled during training; final val still runs after .run()
     cfg.val_epoch_freq = 999999
