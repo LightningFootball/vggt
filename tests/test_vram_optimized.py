@@ -70,12 +70,13 @@ def test_heads_numerical_equivalence():
     embed_dim = 64
     depth = 8
     num_heads = 8
+    patch_size = 16  # ensure multiples
     images = torch.rand(B, S, 3, H, W)
 
     # Aggregators
     agg_full = Aggregator(
         img_size=H,
-        patch_size=14,
+        patch_size=patch_size,
         embed_dim=embed_dim,
         depth=depth,
         num_heads=num_heads,
@@ -85,7 +86,7 @@ def test_heads_numerical_equivalence():
     sel = [1, 3, 5, 7]
     agg_opt = AggregatorVramOptimized(
         img_size=H,
-        patch_size=14,
+        patch_size=patch_size,
         embed_dim=embed_dim,
         depth=depth,
         num_heads=num_heads,
