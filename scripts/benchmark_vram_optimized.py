@@ -1,28 +1,51 @@
 import time
+import argparse
 import torch
 
 from vggt.models.aggregator import Aggregator
-from vggt.models.aggregator_vram_optimized import AggregatorVramOptimized
+from vggt.models.aggregator_vram_optimized import AggregatorVramOptimized, LayerSelectView
 from vggt.heads.camera_head import CameraHead
 from vggt.heads.dpt_head import DPTHead
 
 
-def main():
-    torch.manual_seed(0)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--batch", type=int, default=1)
+    ap.add_argument("--seq", type=int, default=4)
+    ap.add_argument("--img", type=int, default=112, help="square image H=W")
+    ap.add_argument("--patch", type=int, default=14)
+    ap.add_argument("--embed_dim", type=int, default=128)
+    ap.add_argument("--depth", type=int, default=24)
+    ap.add_argument("--heads", type=int, default=16)
+    ap.add_argument("--selected", type=str, default="4,11,17,23")
+    return ap.parse_args()
 
-    B, S, H, W = 1, 4, 112, 112
-    embed_dim = 128
-    depth = 24
-    num_heads = 16
+
+def tensor_list_nbytes(tensors):
+    total = 0
+    for t in tensors:
+        if isinstance(t, torch.Tensor):
+            total += t.element_size() * t.nelement()
+    return total
+
+
+def main():
+    args = parse_args()
+    torch.manual_seed(0)
+
+    device = torch.device(args.device)
+    B, S, img_size, patch_size = args.batch, args.seq, args.img, args.patch
+    H = W = img_size - (img_size % patch_size)
+
+    embed_dim, depth, num_heads = args.embed_dim, args.depth, args.heads
+    sel = [int(x) for x in args.selected.split(",") if x.strip()]
 
     images = torch.rand(B, S, 3, H, W, device=device)
 
-    sel = [4, 11, 17, 23]
-
     agg_full = Aggregator(
         img_size=H,
-        patch_size=14,
+        patch_size=patch_size,
         embed_dim=embed_dim,
         depth=depth,
         num_heads=num_heads,
@@ -31,7 +54,7 @@ def main():
 
     agg_opt = AggregatorVramOptimized(
         img_size=H,
-        patch_size=14,
+        patch_size=patch_size,
         embed_dim=embed_dim,
         depth=depth,
         num_heads=num_heads,
@@ -39,33 +62,47 @@ def main():
         selected_layer_idx=sel,
     ).to(device).eval()
 
+    # align weights for equality check fairness
+    agg_opt.load_state_dict(agg_full.state_dict(), strict=False)
+
     cam_head = CameraHead(dim_in=2 * embed_dim).to(device).eval()
     dpt_head = DPTHead(
         dim_in=2 * embed_dim,
         output_dim=2,
-        features=128,
-        out_channels=[128, 128, 128, 128],
+        features=min(128, embed_dim),
+        out_channels=[min(128, embed_dim)] * 4,
         intermediate_layer_idx=sel,
         pos_embed=False,
+        patch_size=patch_size,
     ).to(device).eval()
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.no_grad():
         full_list, patch_start = agg_full(images)
+        # estimate bytes of stored outputs
+        full_bytes = tensor_list_nbytes(full_list)
         cam_full = cam_head(full_list)
         d_full_pred, d_full_conf = dpt_head(full_list, images=images, patch_start_idx=patch_start)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     t1 = time.perf_counter()
     mem_full = torch.cuda.max_memory_allocated() if device.type == "cuda" else None
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
     t2 = time.perf_counter()
     with torch.no_grad():
         view, patch_start2, kept = agg_opt(images)
+        assert isinstance(view, LayerSelectView)
+        opt_bytes = tensor_list_nbytes(view._selected_outputs)  # type: ignore[attr-defined]
         cam_opt = cam_head(view)
         d_opt_pred, d_opt_conf = dpt_head(view, images=images, patch_start_idx=patch_start2)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     t3 = time.perf_counter()
     mem_opt = torch.cuda.max_memory_allocated() if device.type == "cuda" else None
 
@@ -80,6 +117,8 @@ def main():
         print(f"Peak CUDA memory (bytes): full={mem_full}, optimized={mem_opt}")
     else:
         print("CUDA not available; memory stats skipped.")
+
+    print(f"Stored layer outputs size (MB): full={full_bytes/1e6:.2f}, optimized={opt_bytes/1e6:.2f}")
 
 
 if __name__ == "__main__":
