@@ -1,9 +1,16 @@
 import argparse
 import os
+import sys
 import logging
 
 from hydra import initialize, compose
 from omegaconf import OmegaConf
+
+# Ensure 'training/' is on sys.path so absolute imports like 'train_utils.*' work
+_ROOT = os.path.dirname(__file__)
+_TRAIN_DIR = os.path.join(_ROOT, "training")
+if _TRAIN_DIR not in sys.path:
+    sys.path.insert(0, _TRAIN_DIR)
 
 from training.trainer_batch_optimized import TrainerBatchOptimized
 
@@ -71,4 +78,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
