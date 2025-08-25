@@ -1,0 +1,28 @@
+# Core training dependencies for `training/` and `training_batch_optimized.py`
+# Aligned with existing library versions in requirements.txt
+
+# PyTorch core
+torch==2.3.1
+torchvision==0.18.1
+
+# Array & image basics
+numpy==1.26.1
+Pillow
+opencv-python
+
+# Logging/visualization
+tensorboard
+
+# Config & instantiation
+hydra-core
+omegaconf
+
+# IO utilities and glob matching
+iopath
+wcmatch
+
+# Project library deps (used by vggt model and utils in training)
+huggingface_hub
+einops
+safetensors
+
