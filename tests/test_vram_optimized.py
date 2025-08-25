@@ -40,6 +40,9 @@ def test_selected_view_indexing_and_shape():
         selected_layer_idx=selected_idx,
     ).eval()
 
+    # make sure both aggregators share identical weights for fair comparison
+    agg_opt.load_state_dict(agg_full.state_dict(), strict=False)
+
     full_list, patch_start_full = agg_full(images)
     view, patch_start_opt, kept = agg_opt(images)
 
@@ -93,6 +96,9 @@ def test_heads_numerical_equivalence():
         patch_embed="conv",
         selected_layer_idx=sel,
     ).eval()
+
+    # align weights
+    agg_opt.load_state_dict(agg_full.state_dict(), strict=False)
 
     # Run aggregators
     full_list, patch_start_full = agg_full(images)
