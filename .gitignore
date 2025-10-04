@@ -161,3 +161,6 @@ skyseg.onnx
 .vscode/
 .history/
 .ropeproject/
+
+# macOS archive artifacts
+__MACOSX/
