@@ -142,3 +142,11 @@ python examples/simple_trainer.py default --data_factor 1 --data_dir /YOUR/SCENE
 Model checkpoint licensing:
 - **Original checkpoint** (`facebook/VGGT-1B`): Non-commercial use only
 - **Commercial checkpoint** (`facebook/VGGT-1B-Commercial`): Allows commercial use (excluding military applications)
+
+## Git Commit Guidelines
+
+When creating git commits:
+- Use concise, imperative commit messages
+- **DO NOT** include Claude Code attribution footer (no "🤖 Generated with Claude Code" or "Co-Authored-By: Claude")
+- Follow conventional commit format: `<type>: <description>` (e.g., `feat:`, `fix:`, `docs:`, `refactor:`)
+- Include detailed description in commit body for significant changes
