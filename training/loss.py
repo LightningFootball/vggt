@@ -94,7 +94,8 @@ def compute_camera_loss(
     # Binary mask for valid points per frame (B, N, H, W)
     point_masks = batch_data['point_masks']
     # Only consider frames with enough valid points (>100)
-    valid_frame_mask = point_masks[:, 0].sum(dim=[-1, -2]) > 100
+    # ETH3D sparse coverage per frame is low; consider a frame valid with >=10 points
+    valid_frame_mask = point_masks[:, 0].sum(dim=[-1, -2]) > 10
     # Number of prediction stages
     n_stages = len(pred_pose_encodings)
 
@@ -215,7 +216,8 @@ def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
     
     gt_points = check_and_fix_inf_nan(gt_points, "gt_points")
     
-    if gt_points_mask.sum() < 100:
+    # ETH3D sparse supervision can be very limited; use a small threshold
+    if gt_points_mask.sum() < 10:
         # If there are less than 100 valid points, skip this batch
         dummy_loss = (0.0 * pred_points).mean()
         loss_dict = {f"loss_conf_point": dummy_loss,
@@ -256,7 +258,8 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
     gt_depth = gt_depth[..., None]              # (B, H, W, 1)
     gt_depth_mask = batch['point_masks'].clone()   # 3D points derived from depth map, so we use the same mask
 
-    if gt_depth_mask.sum() < 100:
+    # ETH3D sparse supervision can be very limited; use a small threshold
+    if gt_depth_mask.sum() < 10:
         # If there are less than 100 valid points, skip this batch
         dummy_loss = (0.0 * pred_depth).mean()
         loss_dict = {f"loss_conf_depth": dummy_loss,
@@ -805,5 +808,3 @@ def sequence_loss(flow_preds, flow_gt, vis, valids, gamma=0.8, vis_aware=False, 
 
     return flow_loss
 '''
-
-

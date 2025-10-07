@@ -1,0 +1,75 @@
+defaults:
+  - lora_eth3d_strategy_b.yaml  # Inherit from Strategy B
+  - _self_
+
+# Strategy C: Full LoRA on All Transformer Layers (Maximum Capacity, Highest Memory)
+exp_name: lora_eth3d_strategy_c_r16
+
+# LoRA Configuration
+lora:
+  enabled: True
+  rank: 16                  # Keep at 16 for full LoRA to manage memory
+  alpha: 32
+  dropout: 0.1
+  # Target ALL Aggregator layers + Depth Head
+  target_modules:
+    # All Aggregator frame_blocks (0-23)
+    - "aggregator.frame_blocks.*.attn.qkv"
+    - "aggregator.frame_blocks.*.attn.proj"
+    - "aggregator.frame_blocks.*.mlp.fc1"
+    - "aggregator.frame_blocks.*.mlp.fc2"
+    # All Aggregator global_blocks (0-23)
+    - "aggregator.global_blocks.*.attn.qkv"
+    - "aggregator.global_blocks.*.attn.proj"
+    - "aggregator.global_blocks.*.mlp.fc1"
+    - "aggregator.global_blocks.*.mlp.fc2"
+    # Depth Head
+    - "depth_head.projects.*"
+    - "depth_head.scratch.*"
+    # Optionally include Camera Head
+    - "camera_head.trunk.*.attn.qkv"
+    - "camera_head.trunk.*.attn.proj"
+    - "camera_head.trunk.*.mlp.fc1"
+    - "camera_head.trunk.*.mlp.fc2"
+
+# Further reduce batch size for full LoRA
+max_img_per_gpu: 2
+
+# Adjust loss to also train camera
+loss:
+  camera:
+    weight: 3.0              # Re-enable camera loss
+  depth:
+    weight: 5.0
+
+optim:
+  optimizer:
+    lr: 3e-5                 # Even lower LR for full model
+    weight_decay: 0.01
+
+  frozen_module_names:
+    # Only freeze patch embedding (keep it frozen to preserve pre-trained features)
+    - "aggregator.patch_embed.*"
+
+  gradient_clip:
+    configs:
+      - module_name: ["aggregator"]
+        max_norm: 0.5        # Stricter clipping for full LoRA
+        norm_type: 2
+      - module_name: ["depth_head"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["camera_head"]
+        max_norm: 1.0
+        norm_type: 2
+
+logging:
+  log_dir: logs/${exp_name}
+  tensorboard_writer:
+    path: ${logging.log_dir}/tensorboard
+
+checkpoint:
+  save_dir: logs/${exp_name}/ckpts
+
+# Increase training epochs for full LoRA
+max_epochs: 30

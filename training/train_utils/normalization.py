@@ -60,20 +60,20 @@ def normalize_camera_extrinsics_and_points_batch(
     check_valid_tensor(depths, "depths")
 
 
-    B, S, _, _ = extrinsics.shape
+    B, S, H, W = extrinsics.shape
     device = extrinsics.device
-    assert device == torch.device("cpu")
 
-
-    # Convert extrinsics to homogeneous form: (B, N,4,4)
-    extrinsics_homog = torch.cat(
-        [
-            extrinsics,
-            torch.zeros((B, S, 1, 4), device=device),
-        ],
-        dim=-2,
-    )
-    extrinsics_homog[:, :, -1, -1] = 1.0
+    # Convert extrinsics to homogeneous form: (B, S, 4, 4)
+    if (H, W) == (4, 4):
+        extrinsics_homog = extrinsics
+    elif (H, W) == (3, 4):
+        pad_row = torch.zeros((B, S, 1, 4), device=device, dtype=extrinsics.dtype)
+        extrinsics_homog = torch.cat([extrinsics, pad_row], dim=-2)
+        extrinsics_homog[:, :, -1, -1] = 1.0
+    else:
+        raise ValueError(
+            f"Expected extrinsics of shape (B,S,3,4) or (B,S,4,4), got {extrinsics.shape}"
+        )
 
     # first_cam_extrinsic_inv, the inverse of the first camera's extrinsic matrix
     # which can be also viewed as the cam_to_world extrinsic matrix
@@ -112,7 +112,7 @@ def normalize_camera_extrinsics_and_points_batch(
     else:
         return new_extrinsics[:, :, :3], cam_points, new_world_points, depths
 
-    new_extrinsics = new_extrinsics[:, :, :3] # 4x4 -> 3x4
+    new_extrinsics = new_extrinsics[:, :, :3]  # 4x4 -> 3x4
     new_extrinsics = check_and_fix_inf_nan(new_extrinsics, "new_extrinsics", hard_max=None)
     new_cam_points = check_and_fix_inf_nan(new_cam_points, "new_cam_points", hard_max=None)
     new_world_points = check_and_fix_inf_nan(new_world_points, "new_world_points", hard_max=None)
@@ -120,7 +120,6 @@ def normalize_camera_extrinsics_and_points_batch(
 
 
     return new_extrinsics, new_cam_points, new_world_points, new_depths
-
 
 
 

@@ -92,7 +92,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         predictions = {}
 
         # 禁用自动混合精度
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             # 如果启用了相机头，则调用相机头，获取相机位姿编码
             if self.camera_head is not None:
                 # 调用相机头，获取相机位姿编码
@@ -134,4 +134,3 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             predictions["images"] = images  # store the images for visualization during inference
 
         return predictions
-

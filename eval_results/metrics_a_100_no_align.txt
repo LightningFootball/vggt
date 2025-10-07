@@ -1,0 +1,25 @@
+Evaluation Results
+================================================================================
+mae_mean: 12.200397674242655
+mae_std: 4.519340010899591
+mae_median: 12.666548728942871
+rmse_mean: 14.02691117922465
+rmse_std: 5.285250931626913
+rmse_median: 14.743715286254883
+abs_rel_mean: 0.9269465933243434
+abs_rel_std: 0.014985403786618482
+abs_rel_median: 0.9275282621383667
+sq_rel_mean: 11.38369487921397
+sq_rel_std: 4.301465522572267
+sq_rel_median: 11.75419282913208
+delta_1_mean: 5.931198053682844e-05
+delta_1_std: 0.0004555839670981254
+delta_1_median: 0.0
+delta_2_mean: 0.00028465904373054706
+delta_2_std: 0.0010862277401721245
+delta_2_median: 0.0
+delta_3_mean: 0.000542839903694888
+delta_3_std: 0.0015492050082018336
+delta_3_median: 0.0
+num_valid_frames: 60
+num_total_frames: 60

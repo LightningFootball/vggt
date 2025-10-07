@@ -75,6 +75,7 @@ class Trainer:
         limit_val_batches: Optional[int] = None,
         optim: Optional[Dict[str, Any]] = None,
         loss: Optional[Dict[str, Any]] = None,
+        lora: Optional[Dict[str, Any]] = None,
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
         **kwargs,
@@ -98,6 +99,7 @@ class Trainer:
             limit_val_batches: Limit the number of validation batches per epoch (for debugging).
             optim: Hydra config for optimizers and schedulers.
             loss: Hydra config for the loss function.
+            lora: Hydra config for LoRA (optional).
             env_variables: Dictionary of environment variables to set.
             accum_steps: Number of steps to accumulate gradients before an optimizer step.
         """
@@ -107,6 +109,7 @@ class Trainer:
         # Store Hydra configurations
         self.data_conf = data
         self.model_conf = model
+        self.lora_conf = lora
         self.loss_conf = loss
         self.logging_conf = logging
         self.checkpoint_conf = checkpoint
@@ -201,23 +204,60 @@ class Trainer:
 
         with g_pathmgr.open(ckpt_path, "rb") as f:
             checkpoint = torch.load(f, map_location="cpu")
-        
+
         # Load model state
         model_state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+
+        # Handle LoRA model prefix mismatch
+        # LoRA wraps models with 'base_model.model.' prefix
+        # If loading pretrained weights into LoRA model, add prefix
+        from peft import PeftModel
+        if isinstance(self.model, PeftModel):
+            # Check if checkpoint keys have the prefix
+            sample_key = next(iter(model_state_dict.keys()))
+            if not sample_key.startswith('base_model.model.'):
+                logging.info("Adding 'base_model.model.' prefix to checkpoint keys for LoRA model")
+                model_state_dict = {
+                    f'base_model.model.{k}': v for k, v in model_state_dict.items()
+                }
+
         missing, unexpected = self.model.load_state_dict(
             model_state_dict, strict=self.checkpoint_conf.strict
         )
         if self.rank == 0:
-            logging.info(f"Model state loaded. Missing keys: {missing or 'None'}. Unexpected keys: {unexpected or 'None'}.")
+            logging.info(f"Model state loaded. Missing keys: {len(missing)} keys. Unexpected keys: {len(unexpected)} keys.")
+            if len(missing) > 0 and len(missing) <= 10:
+                logging.info(f"Missing keys sample: {missing[:10]}")
+            if len(unexpected) > 0 and len(unexpected) <= 10:
+                logging.info(f"Unexpected keys sample: {unexpected[:10]}")
 
         # Load optimizer state if available and in training mode
-        if "optimizer" in checkpoint:
+        if "optimizer" in checkpoint and self.mode == "train":
             logging.info(f"Loading optimizer state dict (rank {self.rank})")
-            self.optims.optimizer.load_state_dict(checkpoint["optimizer"])
+            opt_state = checkpoint["optimizer"]
+            try:
+                if isinstance(opt_state, list):
+                    if len(opt_state) != len(self.optims):
+                        logging.warning(
+                            f"Checkpoint has {len(opt_state)} optimizers, but trainer has {len(self.optims)}. Skipping optimizer load."
+                        )
+                    else:
+                        for opt, state in zip(self.optims, opt_state):
+                            opt.optimizer.load_state_dict(state)
+                else:
+                    if len(self.optims) == 1:
+                        self.optims[0].optimizer.load_state_dict(opt_state)
+                    else:
+                        logging.warning(
+                            "Checkpoint stores a single optimizer state but trainer has multiple. Skipping optimizer load."
+                        )
+            except Exception as e:
+                logging.error(f"Failed to load optimizer state: {e}")
 
         # Load training progress
-        if "epoch" in checkpoint:
-            self.epoch = checkpoint["epoch"]
+        epoch_in_ckpt = checkpoint.get("epoch", checkpoint.get("prev_epoch", None))
+        if epoch_in_ckpt is not None:
+            self.epoch = epoch_in_ckpt
         self.steps = checkpoint["steps"] if "steps" in checkpoint else {"train": 0, "val": 0}
         self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
 
@@ -261,6 +301,26 @@ class Trainer:
             logging.info(
                 f"[Done] Freezing modules: {self.optim_conf.frozen_module_names} on rank {self.distributed_rank}"
             )
+
+        # Apply LoRA if enabled
+        lora_config = getattr(self, 'lora_conf', None)
+        if lora_config is not None and lora_config.get('enabled', False):
+            logging.info("[Start] Applying LoRA to model")
+            try:
+                from lora_utils import apply_lora_to_model
+                self.model = apply_lora_to_model(
+                    self.model,
+                    lora_config=lora_config,
+                    verbose=(self.rank == 0)
+                )
+                logging.info("[Done] LoRA applied successfully")
+            except ImportError as e:
+                logging.error(f"Failed to import LoRA utilities: {e}")
+                logging.error("Please install PEFT library: pip install peft")
+                raise
+            except Exception as e:
+                logging.error(f"Failed to apply LoRA: {e}")
+                raise
 
         # Log model summary on rank 0
         if self.rank == 0:
@@ -310,7 +370,7 @@ class Trainer:
         Args:
             epoch: The current epoch number.
             checkpoint_names: A list of names for the checkpoint file (e.g., "checkpoint_latest").
-                              If None, saves "checkpoint" and "checkpoint_{epoch}" on frequency.
+                              If None, saves "checkpoint_{epoch}" only.
         """
         # Allow disabling checkpoints via config: checkpoint.enabled: False
         if getattr(self.checkpoint_conf, "enabled", True) is False:
@@ -320,16 +380,11 @@ class Trainer:
         checkpoint_folder = self.checkpoint_conf.save_dir
         safe_makedirs(checkpoint_folder)
         if checkpoint_names is None:
-            checkpoint_names = ["checkpoint"]
-            if (
-                self.checkpoint_conf.save_freq > 0
-                and int(epoch) % self.checkpoint_conf.save_freq == 0
-                and (int(epoch) > 0 or self.checkpoint_conf.save_freq == 1)
-            ):
-                checkpoint_names.append(f"checkpoint_{int(epoch)}")
+            # Always use numbered checkpoint format
+            checkpoint_names = [f"checkpoint_{int(epoch)}"]
 
         checkpoint_content = {
-            "prev_epoch": epoch,
+            "epoch": epoch,
             "steps": self.steps,
             "time_elapsed": self.time_elapsed_meter.val,
             "optimizer": [optim.optimizer.state_dict() for optim in self.optims],
@@ -465,7 +520,7 @@ class Trainer:
             data_time.update(time.time() - end)
             data_times.append(data_time.val)
             
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast('cuda', enabled=False):
                 batch = self._process_batch(batch)
             batch = copy_data_to_device(batch, self.device, non_blocking=True)
 
@@ -478,10 +533,7 @@ class Trainer:
             
             # compute output
             with torch.no_grad():
-                with torch.cuda.amp.autocast(
-                    enabled=self.optim_conf.amp.enabled,
-                    dtype=amp_type,
-                ):
+                with torch.amp.autocast('cuda', enabled=self.optim_conf.amp.enabled, dtype=amp_type):
                     val_loss_dict = self._step(
                         batch, self.model, phase, loss_meters
                     )
@@ -557,7 +609,7 @@ class Trainer:
             data_times.append(data_time.val)
 
             
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast('cuda', enabled=False):
                 batch = self._process_batch(batch)
 
             batch = copy_data_to_device(batch, self.device, non_blocking=True)
@@ -671,10 +723,7 @@ class Trainer:
             )
 
             with ddp_context:
-                with torch.cuda.amp.autocast(
-                    enabled=self.optim_conf.amp.enabled,
-                    dtype=amp_type,
-                ):
+                with torch.amp.autocast('cuda', enabled=self.optim_conf.amp.enabled, dtype=amp_type):
                     loss_dict = self._step(
                         chunked_batch, self.model, phase, loss_meters
                     )
@@ -718,10 +767,17 @@ class Trainer:
         
         return batch
 
-    def _process_batch(self, batch: Mapping):      
+    def _process_batch(self, batch: Mapping):
+        # Debug: Print batch shapes
+        if self.rank == 0 and self.steps.get('train', 0) == 0:
+            logging.info("Batch shapes at start of _process_batch:")
+            for k, v in batch.items():
+                if hasattr(v, 'shape'):
+                    logging.info(f"  {k}: {v.shape}")
+
         if self.data_conf.train.common_config.repeat_batch:
             batch = self._apply_batch_repetition(batch)
-        
+
         # Normalize camera extrinsics and points. The function returns new tensors.
         normalized_extrinsics, normalized_cam_points, normalized_world_points, normalized_depths = \
             normalize_camera_extrinsics_and_points_batch(
@@ -802,16 +858,59 @@ class Trainer:
 
             name = f"Visuals/{phase}"
 
-            visuals_to_log = torchvision.utils.make_grid(
-                [
-                    torchvision.utils.make_grid(
-                        batch[key][0],  # Ensure batch[key][0] is tensor and has at least 3 dimensions
-                        nrow=self.logging_conf.visuals_per_batch_to_log,
-                    )
-                    for key in keys_to_log if key in batch and batch[key][0].dim() >= 3
-                ],
-                nrow=1,
-            ).clamp(-1, 1)
+            def to_grid(x: torch.Tensor) -> torch.Tensor:
+                # Normalize variety of shapes to [N,C,H,W]
+                if x.dim() == 5:  # [B,S,C,H,W] or [B,S,H,W,1]
+                    x = x[0]
+                if x.dim() == 4:
+                    # [S,C,H,W] or [S,H,W,1]
+                    if x.shape[-1] in (1, 3) and x.shape[1] not in (1, 3):
+                        # likely NHWC -> NCHW
+                        x = x.permute(0, 3, 1, 2).contiguous()
+                elif x.dim() == 3:
+                    # Could be [S,H,W] (no channel) or [C,H,W] (single image)
+                    if x.shape[0] not in (1, 3):
+                        # treat as [S,H,W]
+                        x = x.unsqueeze(1)
+                    else:
+                        x = x.unsqueeze(0)
+                elif x.dim() == 2:
+                    x = x.unsqueeze(0).unsqueeze(0)
+
+                # Ensure channel in {1,3}
+                if x.shape[1] == 1:
+                    x = x.repeat(1, 3, 1, 1)
+                elif x.shape[1] != 3:
+                    # Reduce or expand to 3 channels by selecting/averaging first 3
+                    if x.shape[1] > 3:
+                        x = x[:, :3]
+                    else:
+                        reps = (3 + x.shape[1] - 1) // x.shape[1]
+                        x = x.repeat(1, reps, 1, 1)[:, :3]
+
+                grid = torchvision.utils.make_grid(
+                    x,
+                    nrow=self.logging_conf.visuals_per_batch_to_log,
+                )
+                return grid
+
+            grids = []
+            for key in keys_to_log:
+                if key in batch:
+                    try:
+                        grids.append(to_grid(batch[key]))
+                    except Exception:
+                        continue
+
+            if not grids:
+                return
+
+            # Ensure same spatial size by min-cropping to smallest H,W
+            min_h = min(g.shape[1] for g in grids)
+            min_w = min(g.shape[2] for g in grids)
+            grids = [g[:, :min_h, :min_w] for g in grids]
+
+            visuals_to_log = torchvision.utils.make_grid(grids, nrow=1).clamp(-1, 1)
 
             visuals_to_log = visuals_to_log.cpu()
             if visuals_to_log.dtype == torch.bfloat16:

@@ -25,7 +25,8 @@ class DynamicTorchDataset(ABC):
         drop_last: bool = True,
         collate_fn: Optional[Callable] = None,
         worker_init_fn: Optional[Callable] = None,
-        persistent_workers: bool = False,
+        persistent_workers: bool = True,
+        prefetch_factor: Optional[int] = None,
         seed: int = 42,
         max_img_per_gpu: int = 48,
     ) -> None:
@@ -38,6 +39,7 @@ class DynamicTorchDataset(ABC):
         self.collate_fn = collate_fn
         self.worker_init_fn = worker_init_fn
         self.persistent_workers = persistent_workers
+        self.prefetch_factor = prefetch_factor
         self.seed = seed
         self.max_img_per_gpu = max_img_per_gpu
 
@@ -64,18 +66,28 @@ class DynamicTorchDataset(ABC):
             max_img_per_gpu=max_img_per_gpu
         )
 
+        self._loader = None
+
     def get_loader(self, epoch):
         print("Building dynamic dataloader with epoch:", epoch)
 
         # Set the epoch for the sampler
         self.sampler.set_epoch(epoch)
+        self.batch_sampler.set_epoch(epoch)
         if hasattr(self.dataset, "epoch"):
             self.dataset.epoch = epoch
         if hasattr(self.dataset, "set_epoch"):
             self.dataset.set_epoch(epoch)
 
+        if self.persistent_workers and self._loader is not None:
+            return self._loader
+
         # Create and return the dataloader
-        return DataLoader(
+        loader_kwargs = {}
+        if self.prefetch_factor is not None and self.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
+
+        loader = DataLoader(
             self.dataset,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
@@ -88,7 +100,13 @@ class DynamicTorchDataset(ABC):
                 epoch=epoch,
                 worker_init_fn=self.worker_init_fn,
             ),
+            **loader_kwargs,
         )
+
+        if self.persistent_workers:
+            self._loader = loader
+
+        return loader
         
 
 class DynamicBatchSampler(Sampler):

@@ -1,3 +1,35 @@
+"""
+Benchmark VRAM-optimized aggregator vs. baseline.
+
+This script compares the baseline Aggregator with the VRAM-optimized
+AggregatorVramOptimized on random inputs. It prints:
+- Numerical equality checks for heads (camera and DPT depth).
+- Wall-clock timings for baseline vs optimized forward passes.
+- Peak CUDA memory (if running on GPU) for both variants.
+- Estimated memory of stored intermediate layer outputs (in MB).
+
+Arguments:
+- `--device` (str): Device to run on. Defaults to `cuda` if available,
+  otherwise `cpu`.
+- `--batch` (int): Batch size B. Default: 1.
+- `--seq` (int): Sequence length S (number of frames). Default: 4.
+- `--img` (int): Square input size. H=W will be adjusted to be a multiple
+  of `--patch`. Default: 112.
+- `--patch` (int): Patch size used by the (conv) PatchEmbed. Default: 14.
+- `--embed_dim` (int): Embedding dimension for the aggregators/heads.
+  Default: 128.
+- `--depth` (int): Number of alternating-attention blocks (total depth).
+  Default: 24.
+- `--heads` (int): Number of attention heads. Default: 16.
+- `--selected` (str): Comma-separated absolute layer indices to keep in the
+  optimized aggregator (e.g., "4,11,17,23"). When fewer layers are kept,
+  intermediate activation storage is reduced.
+
+Usage examples:
+- `python scripts/benchmark_vram_optimized.py --device cuda`
+- `python scripts/benchmark_vram_optimized.py --seq 8 --selected 3,7,11,15`
+"""
+
 import time
 import argparse
 import torch

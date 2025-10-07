@@ -1,0 +1,71 @@
+defaults:
+  - lora_eth3d_strategy_a.yaml  # Inherit from Strategy A
+  - _self_
+
+# Strategy B: LoRA on Aggregator Late Layers + Depth Head (Recommended for Best Performance)
+exp_name: lora_eth3d_strategy_b_r16
+
+# LoRA Configuration
+lora:
+  enabled: True
+  rank: 16                  # Can increase to 32 if needed
+  alpha: 32
+  dropout: 0.1
+  # Target Aggregator late layers (12-23) + Depth Head
+  target_modules:
+    # Aggregator frame_blocks layers 12-23 (late layers)
+    - "aggregator.frame_blocks.1[2-9].attn.qkv"        # Layers 12-19
+    - "aggregator.frame_blocks.1[2-9].attn.proj"
+    - "aggregator.frame_blocks.1[2-9].mlp.fc1"
+    - "aggregator.frame_blocks.1[2-9].mlp.fc2"
+    - "aggregator.frame_blocks.2[0-3].attn.qkv"        # Layers 20-23
+    - "aggregator.frame_blocks.2[0-3].attn.proj"
+    - "aggregator.frame_blocks.2[0-3].mlp.fc1"
+    - "aggregator.frame_blocks.2[0-3].mlp.fc2"
+    # Aggregator global_blocks layers 12-23
+    - "aggregator.global_blocks.1[2-9].attn.qkv"
+    - "aggregator.global_blocks.1[2-9].attn.proj"
+    - "aggregator.global_blocks.1[2-9].mlp.fc1"
+    - "aggregator.global_blocks.1[2-9].mlp.fc2"
+    - "aggregator.global_blocks.2[0-3].attn.qkv"
+    - "aggregator.global_blocks.2[0-3].attn.proj"
+    - "aggregator.global_blocks.2[0-3].mlp.fc1"
+    - "aggregator.global_blocks.2[0-3].mlp.fc2"
+    # Depth Head (same as Strategy A)
+    - "depth_head.projects.*"
+    - "depth_head.scratch.*"
+
+# Adjust batch size for more parameters being trained
+max_img_per_gpu: 3           # Slightly reduce for Strategy B
+
+optim:
+  optimizer:
+    lr: 5e-5                 # Slightly lower LR for more modules
+    weight_decay: 0.01
+
+  frozen_module_names:
+    # Only freeze early layers of aggregator + camera head
+    - "aggregator.frame_blocks.[0-9].*"      # Layers 0-9 (early layers)
+    - "aggregator.frame_blocks.1[0-1].*"     # Layers 10-11
+    - "aggregator.global_blocks.[0-9].*"
+    - "aggregator.global_blocks.1[0-1].*"
+    - "aggregator.patch_embed.*"             # Freeze patch embedding
+    - "*camera_head*"                        # Freeze camera head
+
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["aggregator"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["depth_head"]
+        max_norm: 1.0
+        norm_type: 2
+
+logging:
+  log_dir: logs/${exp_name}
+  tensorboard_writer:
+    path: ${logging.log_dir}/tensorboard
+
+checkpoint:
+  save_dir: logs/${exp_name}/ckpts

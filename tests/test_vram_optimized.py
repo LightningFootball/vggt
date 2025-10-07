@@ -29,6 +29,8 @@ def test_selected_view_indexing_and_shape():
     ).eval()
 
     # Optimized aggregator (stores only selected)
+    # For depth=8 test model, use proportional indices: [1, 3, 5, 7]
+    # (For production depth=24 model, use [4, 11, 17, 23])
     selected_idx = [1, 3, 5, 7]
     agg_opt = AggregatorVramOptimized(
         img_size=H,
@@ -86,6 +88,8 @@ def test_heads_numerical_equivalence():
         patch_embed="conv",
     ).eval()
 
+    # For depth=8 test model, use proportional indices: [1, 3, 5, 7]
+    # (For production depth=24 model, use [4, 11, 17, 23])
     sel = [1, 3, 5, 7]
     agg_opt = AggregatorVramOptimized(
         img_size=H,

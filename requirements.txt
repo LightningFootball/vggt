@@ -1,7 +1,8 @@
-torch==2.3.1
-torchvision==0.18.1
+torch==2.8.0
+torchvision
 numpy==1.26.1
 Pillow
 huggingface_hub
 einops
 safetensors
+peft>=0.7.0  # For LoRA training

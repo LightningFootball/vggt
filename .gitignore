@@ -164,3 +164,7 @@ skyseg.onnx
 
 # macOS archive artifacts
 __MACOSX/
+
+# Training outputs
+logs/
+pretrained/

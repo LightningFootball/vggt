@@ -1,45 +1,48 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `vggt/`: Core library code (models, heads, layers, utils, dependency).
-  - `vggt/models/vggt.py`: Main model entry.
-- `training/`: Fine-tuning pipeline (Hydra configs under `training/config/`, `launch.py`, `trainer.py`).
-- `examples/`: Sample scenes and inputs for demos.
-- `docs/`: Extra installation/packaging notes.
-- Top-level demos: `demo_gradio.py`, `demo_viser.py`, `demo_colmap.py`.
+- Source: `vggt/` (models, heads, utils), training code in `training/`, examples in `examples/`.
+- Demos: `demo_gradio.py`, `demo_viser.py`, `demo_colmap.py` (+ optimized variants).
+- Scripts & reports: `scripts/`, `report/`, docs in `docs/`.
+- Tests: `tests/` (pytest). Config/package metadata: `pyproject.toml`.
 
 ## Build, Test, and Development Commands
-- Install (library only): `pip install -r requirements.txt && pip install -e .`
-- Demo extras: `pip install -r requirements_demo.txt`
-- Quick import check: `python -c "import vggt; print('ok')"`
-- Run Gradio demo: `python demo_gradio.py`
-- Run Viser viewer: `python demo_viser.py --image_folder path/to/images`
-- Export COLMAP: `python demo_colmap.py --scene_dir=/YOUR/SCENE_DIR [--use_ba]`
-- Train/finetune (DDP example): `torchrun --nproc_per_node=4 training/launch.py`
+- Install core: `pip install -r requirements.txt` (Python 3.10+).
+- Demo extras: `pip install -r requirements_demo.txt`.
+- Training extras: `pip install -r requirements_training.txt`.
+- Editable install: `pip install -e .` (uses setuptools from `pyproject.toml`).
+- Run tests: `pytest -q` (from repo root).
+- Demos:
+  - `python demo_gradio.py`
+  - `python demo_viser.py --image_folder path/to/images`
+  - `python demo_colmap.py --scene_dir /PATH/TO/SCENE [--use_ba]`
+- Benchmarks: `python scripts/benchmark_vram_optimized.py [--device cuda] ...`
+- Example training: `python examples/simple_trainer.py default --data_dir /DATA --result_dir /OUT`.
 
 ## Coding Style & Naming Conventions
-- Language: Python ≥ 3.10; follow PEP 8, 4-space indents, 120-char soft limit.
-- Names: `snake_case` for modules/functions, `PascalCase` for classes, `UPPER_SNAKE` for constants.
-- Types: add type hints where practical (public APIs, data structures).
-- Imports: standard → third-party → local; avoid unused imports.
-- Config: add new options under `training/config/*.yaml` with clear, minimal defaults.
+- Language: Python (>=3.10). Use 4-space indentation and type hints where practical.
+- Names: files/functions `snake_case`, classes `PascalCase`, constants `UPPER_CASE`.
+- Imports: standard lib, third-party, local (grouped). Prefer Black-compatible formatting; keep lines ≤ 88 chars.
+- Keep APIs stable; add docstrings for public functions/classes.
 
 ## Testing Guidelines
-- No unit test suite is present. For contributions:
-  - Add targeted tests under `tests/` (e.g., `tests/test_geometry.py`).
-  - Prefer small, synthetic tensors to exercise shapes/dtypes/device.
-  - Provide runnable repro snippets for demo/training changes.
-  - Validate demos end-to-end with a tiny image set in `examples/`.
+- Framework: pytest. Place tests in `tests/` named `test_*.py`.
+- Keep tests CPU-friendly by default; gate GPU-heavy paths behind flags.
+- Add unit tests for new modules and edge cases. Run `pytest -q` before opening a PR.
 
 ## Commit & Pull Request Guidelines
-- Commits: concise, imperative subject; optional scope, e.g. `train: fix DDP seed sync`.
-- Group related changes; avoid large, mixed commits.
+- Commits: concise, imperative mood. Common prefixes observed: `fix:`, `conf:`, `training:` when relevant.
 - PRs must include:
-  - Summary, rationale, and before/after behavior.
-  - Usage notes (commands/config diffs) and, if UI/demo related, a screenshot or short log.
-  - Linked issues (`Fixes #123`) and limitations.
+  - Summary of changes and rationale
+  - Related issues (e.g., `Closes #123`)
+  - Usage/testing instructions; screenshots for demo/UI changes
+  - Notes on perf/VRAM impact if touching models/inference
 
 ## Security & Configuration Tips
-- Do not commit datasets, checkpoints, or secrets (e.g., HF tokens).
-- Large downloads occur via Hugging Face; allow offline fallback by documenting local paths.
-- GPU memory varies; document flags like `max_img_per_gpu`, `accum_steps`, and learning-rate changes in PRs.
+- Don’t commit large binaries or secrets. Use `.gitignore` patterns already present.
+- Pin new runtime deps in the appropriate `requirements_*.txt` and update `pyproject.toml` only if packaging changes.
+
+## Agent-Specific Instructions
+- Follow this file’s scope across the repo; make minimal, focused changes.
+- Preserve existing file structure and naming; update docs and tests alongside code changes.
+- Avoid broad refactors in unrelated areas without prior discussion.

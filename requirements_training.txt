@@ -2,8 +2,8 @@
 # Aligned with existing library versions in requirements.txt
 
 # PyTorch core
-torch==2.3.1
-torchvision==0.18.1
+torch==2.8.0
+torchvision
 
 # Array & image basics
 numpy==1.26.1
@@ -16,6 +16,7 @@ tensorboard
 # Config & instantiation
 hydra-core
 omegaconf
+fvcore
 
 # IO utilities and glob matching
 iopath
@@ -25,4 +26,3 @@ wcmatch
 huggingface_hub
 einops
 safetensors
-
