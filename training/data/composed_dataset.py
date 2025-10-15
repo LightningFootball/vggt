@@ -40,7 +40,7 @@ class ComposedDataset(Dataset, ABC):
 
         # Instantiate each base dataset with common configuration
         for baseset_dict in dataset_configs:
-            baseset = instantiate(baseset_dict, common_conf=common_config)
+            baseset = instantiate(baseset_dict, common_conf=common_config, _recursive_=False)
             base_dataset_list.append(baseset)
 
         # Use custom concatenation class that supports tuple indexing

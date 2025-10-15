@@ -58,13 +58,47 @@ def check_and_fix_inf_nan(input_tensor, loss_name="default", hard_max=100):
 
 
 def get_resume_checkpoint(checkpoint_save_dir):
+    """
+    Find the latest checkpoint file in the checkpoint directory.
+    Looks for both numbered checkpoints (checkpoint_{epoch}.pt) and
+    the legacy format (checkpoint.pt).
+
+    Returns:
+        str: Path to the latest checkpoint file, or None if not found
+    """
     if not g_pathmgr.isdir(checkpoint_save_dir):
         return None
-    ckpt_file = os.path.join(checkpoint_save_dir, "checkpoint.pt")
-    if not g_pathmgr.isfile(ckpt_file):
-        return None
 
-    return ckpt_file
+    # First, try to find numbered checkpoint files (checkpoint_{epoch}.pt)
+    checkpoint_files = []
+    try:
+        for filename in g_pathmgr.ls(checkpoint_save_dir):
+            if filename.startswith("checkpoint_") and filename.endswith(".pt"):
+                try:
+                    # Extract epoch number from filename
+                    epoch_str = filename[len("checkpoint_"):-len(".pt")]
+                    epoch = int(epoch_str)
+                    checkpoint_files.append((epoch, filename))
+                except ValueError:
+                    # Skip files that don't match the expected format
+                    continue
+    except Exception as e:
+        logging.warning(f"Error listing checkpoint directory {checkpoint_save_dir}: {e}")
+
+    # If we found numbered checkpoints, return the one with the highest epoch
+    if checkpoint_files:
+        latest_epoch, latest_filename = max(checkpoint_files, key=lambda x: x[0])
+        latest_ckpt = os.path.join(checkpoint_save_dir, latest_filename)
+        logging.info(f"Found latest checkpoint: {latest_filename} (epoch {latest_epoch})")
+        return latest_ckpt
+
+    # Fall back to legacy format (checkpoint.pt)
+    ckpt_file = os.path.join(checkpoint_save_dir, "checkpoint.pt")
+    if g_pathmgr.isfile(ckpt_file):
+        logging.info(f"Found checkpoint: checkpoint.pt")
+        return ckpt_file
+
+    return None
 
 class DurationMeter:
     def __init__(self, name, device, fmt=":f"):

@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -31,31 +32,40 @@ class MultitaskLoss(torch.nn.Module):
         self.depth = depth
         self.point = point
         self.track = track
+        # Training state (will be updated by trainer)
+        self.current_epoch = 0
+        self.max_epochs = 100
 
     def forward(self, predictions, batch) -> torch.Tensor:
         """
         Compute the total multi-task loss.
-        
+
         Args:
             predictions: Dict containing model predictions for different tasks
             batch: Dict containing ground truth data and masks
-            
+
         Returns:
             Dict containing individual losses and total objective
         """
         total_loss = 0
         loss_dict = {}
-        
+
         # Camera pose loss - if pose encodings are predicted
         if "pose_enc_list" in predictions:
-            camera_loss_dict = compute_camera_loss(predictions, batch, **self.camera)   
-            camera_loss = camera_loss_dict["loss_camera"] * self.camera["weight"]   
+            camera_loss_dict = compute_camera_loss(predictions, batch, **self.camera)
+            camera_loss = camera_loss_dict["loss_camera"] * self.camera["weight"]
             total_loss = total_loss + camera_loss
             loss_dict.update(camera_loss_dict)
-        
+
         # Depth estimation loss - if depth maps are predicted
         if "depth" in predictions:
-            depth_loss_dict = compute_depth_loss(predictions, batch, **self.depth)
+            # Pass epoch info for curriculum learning
+            depth_loss_dict = compute_depth_loss(
+                predictions, batch,
+                current_epoch=self.current_epoch,
+                max_epochs=self.max_epochs,
+                **self.depth
+            )
             depth_loss = depth_loss_dict["loss_conf_depth"] + depth_loss_dict["loss_reg_depth"] + depth_loss_dict["loss_grad_depth"]
             depth_loss = depth_loss * self.depth["weight"]
             total_loss = total_loss + depth_loss
@@ -238,10 +248,12 @@ def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
     return loss_dict
 
 
-def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn = None, valid_range=-1, **kwargs):
+def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn = None, valid_range=-1,
+                      use_semantic_weighting=False, current_epoch=None, max_epochs=None,
+                      facade_boost_ratio=0.4, **kwargs):
     """
-    Compute depth loss.
-    
+    Compute depth loss with optional semantic weighting and curriculum learning.
+
     Args:
         predictions: Dict containing 'depth' and 'depth_conf'
         batch: Dict containing ground truth 'depths' and 'point_masks'
@@ -249,6 +261,10 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
         alpha: Weight for confidence regularization
         gradient_loss_fn: Type of gradient loss to apply
         valid_range: Quantile range for outlier filtering
+        use_semantic_weighting: Whether to apply semantic pixel weights
+        current_epoch: Current training epoch (for curriculum learning)
+        max_epochs: Total training epochs (for curriculum learning)
+        facade_boost_ratio: Ratio of epochs to boost facade weights (0-1)
     """
     pred_depth = predictions['depth']
     pred_depth_conf = predictions['depth_conf']
@@ -267,6 +283,38 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
                     f"loss_grad_depth": dummy_loss,}
         return loss_dict
 
+    # Apply semantic weighting if enabled
+    if use_semantic_weighting and 'semantic_weights' in batch:
+        semantic_weights = batch['semantic_weights']  # List of (H, W) weights
+        # Convert to tensor and add channel dimension
+        if isinstance(semantic_weights, list):
+            semantic_weights = torch.stack([torch.from_numpy(w) if isinstance(w, np.ndarray) else w
+                                           for w in semantic_weights], dim=0).to(gt_depth.device)
+
+        # Apply curriculum learning scaling (boost facade weights in early training)
+        if current_epoch is not None and max_epochs is not None:
+            boost_epochs = int(max_epochs * facade_boost_ratio)
+            if current_epoch < boost_epochs:
+                # Early phase: boost facade weights (1.5x)
+                semantic_scale = 1.5
+            else:
+                # Late phase: gradually decay boost (1.5 -> 1.0)
+                decay_progress = (current_epoch - boost_epochs) / (max_epochs - boost_epochs)
+                semantic_scale = 1.5 - 0.5 * decay_progress
+        else:
+            semantic_scale = 1.0
+
+        # Apply semantic weights with curriculum scaling
+        semantic_weights = semantic_weights * semantic_scale
+
+        # Reshape to match gt_depth_mask: (B, S, H, W)
+        if semantic_weights.dim() == 3:
+            semantic_weights = semantic_weights.unsqueeze(1)  # Add sequence dim
+
+        # Combine semantic weights with depth mask
+        gt_depth_mask = gt_depth_mask.float() * semantic_weights
+        gt_depth_mask = gt_depth_mask.bool()
+
     # NOTE: we put conf inside regression_loss so that we can also apply conf loss to the gradient loss in a multi-scale manner
     # this is hacky, but very easier to implement
     loss_conf, loss_grad, loss_reg = regression_loss(pred_depth, gt_depth, gt_depth_mask, conf=pred_depth_conf,
@@ -274,7 +322,7 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
 
     loss_dict = {
         f"loss_conf_depth": loss_conf,
-        f"loss_reg_depth": loss_reg,    
+        f"loss_reg_depth": loss_reg,
         f"loss_grad_depth": loss_grad,
     }
 
@@ -305,6 +353,11 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
         loss_reg: Regular L2 loss
     """
     bb, ss, hh, ww, nc = pred.shape
+    eps = 1e-6
+
+    if conf is not None:
+        conf = check_and_fix_inf_nan(conf, "confidence_tensor", hard_max=None)
+        conf = torch.clamp(conf, min=eps)
 
     # Compute L2 distance between predicted and ground truth points
     loss_reg = torch.norm(gt[mask] - pred[mask], dim=-1)
@@ -348,24 +401,57 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
     # Process confidence-weighted loss
     if loss_conf.numel() > 0:
         # Filter out outliers using quantile-based thresholding
-        if valid_range>0:
-            loss_conf = filter_by_quantile(loss_conf, valid_range)
+        # Use mask-based filtering to keep tensor shape consistent for autograd
+        if valid_range > 0 and loss_conf.numel() > 1000:
+            # Clamp to prevent extreme outliers
+            loss_conf_clamped = loss_conf.clamp(max=100)
+            # Compute quantile threshold
+            quantile_thresh = torch_quantile(loss_conf_clamped.detach(), valid_range)
+            quantile_thresh = min(quantile_thresh, 100.0)
+            # Create boolean mask (don't change tensor length!)
+            valid_mask = loss_conf_clamped < quantile_thresh
+            # Check we have enough valid elements
+            if valid_mask.sum() > 1000:
+                # Use masked sum/count instead of indexing to preserve tensor shape
+                loss_conf = (loss_conf_clamped * valid_mask.float()).sum() / valid_mask.float().sum().clamp_min(1)
+            else:
+                loss_conf = loss_conf_clamped.mean()
+        else:
+            loss_conf = loss_conf.mean()
 
         loss_conf = check_and_fix_inf_nan(loss_conf, f"loss_conf_depth")
-        loss_conf = loss_conf.mean()
     else:
         loss_conf = (0.0 * pred).mean()
 
     # Process regular regression loss
     if loss_reg.numel() > 0:
         # Filter out outliers using quantile-based thresholding
-        if valid_range>0:
-            loss_reg = filter_by_quantile(loss_reg, valid_range)
+        # Use mask-based filtering to keep tensor shape consistent for autograd
+        if valid_range > 0 and loss_reg.numel() > 1000:
+            # Clamp to prevent extreme outliers
+            loss_reg_clamped = loss_reg.clamp(max=100)
+            # Compute quantile threshold
+            quantile_thresh = torch_quantile(loss_reg_clamped.detach(), valid_range)
+            quantile_thresh = min(quantile_thresh, 100.0)
+            # Create boolean mask (don't change tensor length!)
+            valid_mask = loss_reg_clamped < quantile_thresh
+            # Check we have enough valid elements
+            if valid_mask.sum() > 1000:
+                # Use masked sum/count instead of indexing to preserve tensor shape
+                loss_reg = (loss_reg_clamped * valid_mask.float()).sum() / valid_mask.float().sum().clamp_min(1)
+            else:
+                loss_reg = loss_reg_clamped.mean()
+        else:
+            loss_reg = loss_reg.mean()
 
         loss_reg = check_and_fix_inf_nan(loss_reg, f"loss_reg_depth")
-        loss_reg = loss_reg.mean()
     else:
         loss_reg = (0.0 * pred).mean()
+
+    if isinstance(loss_grad, torch.Tensor):
+        loss_grad = check_and_fix_inf_nan(loss_grad, f"loss_grad_depth")
+    else:
+        loss_grad = (0.0 * pred).mean()
 
     return loss_conf, loss_grad, loss_reg
 
@@ -492,9 +578,12 @@ def gradient_loss(prediction, target, mask, conf=None, gamma=1.0, alpha=0.2):
 
     # Apply confidence weighting if provided
     if conf is not None:
+        eps = 1e-6
+        conf = check_and_fix_inf_nan(conf, "gradient_confidence", hard_max=None)
+        conf = torch.clamp(conf, min=eps)
         conf = conf[..., None].expand(-1, -1, -1, prediction.shape[-1])
-        conf_x = conf[:, :, 1:]
-        conf_y = conf[:, 1:, :]
+        conf_x = torch.clamp(conf[:, :, 1:], min=eps)
+        conf_y = torch.clamp(conf[:, 1:, :], min=eps)
 
         grad_x = gamma * grad_x * conf_x - alpha * torch.log(conf_x)
         grad_y = gamma * grad_y * conf_y - alpha * torch.log(conf_y)
@@ -504,9 +593,10 @@ def gradient_loss(prediction, target, mask, conf=None, gamma=1.0, alpha=0.2):
     divisor = torch.sum(M)
 
     if divisor == 0:
-        return 0
-    else:
-        grad_loss = torch.sum(grad_loss) / divisor
+        return prediction.new_tensor(0.0)
+
+    grad_loss = torch.sum(grad_loss) / divisor
+    grad_loss = check_and_fix_inf_nan(grad_loss, "loss_grad_depth")
 
     return grad_loss
 

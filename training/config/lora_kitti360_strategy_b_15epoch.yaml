@@ -1,0 +1,92 @@
+defaults:
+  - lora_kitti360_strategy_a.yaml  # Inherit from Strategy A
+  - _self_
+
+# Strategy B: LoRA on Depth Head + Late Transformer Layers (Medium Strength)
+# Adapts both prediction head and high-level transformer features
+# IMPORTANT: This config reduces batch size to prevent OOM and NaN issues
+exp_name: lora_kitti360_strategy_b_r16
+
+# LoRA Configuration - extend to late transformer layers
+lora:
+  enabled: True
+  rank: 16
+  alpha: 32
+  dropout: 0.1
+  # Target Depth Head + Late 8 layers of transformer (16-23 out of 24)
+  target_modules:
+    - "depth_head.*"                        # All depth head modules
+    - "aggregator.frame_blocks.1[6-9].*"   # Frame blocks 16-19
+    - "aggregator.frame_blocks.2[0-3].*"   # Frame blocks 20-23
+    - "aggregator.global_blocks.1[6-9].*"  # Global blocks 16-19
+    - "aggregator.global_blocks.2[0-3].*"  # Global blocks 20-23
+
+# CRITICAL: Reduce batch size to prevent OOM (27GB -> ~18GB)
+max_img_per_gpu: 64        # 6 batches of 8-image sequences (6 * 8 = 48)
+accum_steps: 6             # Split into 4 gradient accumulation steps
+
+
+# Batch size is max_img_per_gpu / sequence_length_effective
+# KITTI-360 uses fixed sequence length of 8
+limit_train_batches: 500  # Cap each epoch to 1000 iterations for faster cycles
+limit_val_batches: 50     # Limit validation to 100 batches to avoid long validation
+
+optim:
+  optimizer:
+    lr: 2e-5                 # REDUCED LR to prevent NaN (was 5e-5)
+    weight_decay: 0.01
+
+  frozen_module_names:
+    - "*aggregator.frame_blocks.[0-9].*"    # Freeze blocks 0-9
+    - "*aggregator.frame_blocks.1[0-5].*"   # Freeze blocks 10-15
+    - "*aggregator.global_blocks.[0-9].*"   # Freeze blocks 0-9
+    - "*aggregator.global_blocks.1[0-5].*"  # Freeze blocks 10-15
+    - "*aggregator.patch_embed*"            # Freeze patch embedding
+    - "*camera_head*"                       # Freeze camera head
+
+  # More aggressive gradient clipping to prevent NaN
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["depth_head"]
+        max_norm: 0.5          # REDUCED from 1.0
+        norm_type: 2
+      - module_name: ["aggregator.frame_blocks", "aggregator.global_blocks"]
+        max_norm: 0.3          # REDUCED from 0.5
+        norm_type: 2
+
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 2e-7
+              end_value: 2e-5
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 2e-5
+              end_value: 2e-7
+          lengths: [0.15, 0.85]  # 15% warmup, 85% cosine decay
+          interval_scaling: ['rescaled', 'rescaled']
+
+max_epochs: 50  # Longer training for transformer adaptation
+
+# CRITICAL: Optimized DataLoader for speed/memory balance
+# KITTI360 dataset does heavy LiDAR processing which causes memory accumulation
+# Tuned for 32-core CPU + 46GB RAM system
+data:
+  train:
+    num_workers: 8        # Balanced: ~85% speed, ~12GB RAM (was 16 = 100% speed but 60GB RAM)
+    prefetch_factor: 1     # Moderate prefetch for throughput
+    persistent_workers: True  # Keep workers alive for speed (monitor RAM!)
+  val:
+    num_workers: 4         # Conservative for validation
+    prefetch_factor: 2
+    persistent_workers: False
+
+# To further optimize (see DATALOADER_TUNING_GUIDE.md):
+# - Increase to workers=12, prefetch=4 for ~95% speed (~23GB RAM)
+# - Or increase max_img_per_gpu to 48 (6 batches) to use more GPU memory
+
+checkpoint:
+  save_freq: 1  # Save less frequently

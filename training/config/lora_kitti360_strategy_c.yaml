@@ -1,0 +1,78 @@
+defaults:
+  - lora_kitti360_strategy_a.yaml  # Inherit from Strategy A
+  - _self_
+
+# Strategy C: LoRA on Depth Head + Full Transformer (Maximum Strength)
+# Full adaptation of transformer features for domain-specific learning
+exp_name: lora_kitti360_strategy_c_r32
+
+# LoRA Configuration - full transformer with higher rank
+lora:
+  enabled: True
+  rank: 32          # Higher rank for full transformer adaptation
+  alpha: 64
+  dropout: 0.1
+  # Target Depth Head + All 24 transformer layers
+  target_modules:
+    - "depth_head.*"                 # All depth head modules
+    - "aggregator.frame_blocks.*"    # All 24 frame blocks
+    - "aggregator.global_blocks.*"   # All 24 global blocks
+
+optim:
+  optimizer:
+    lr: 2e-5                 # Lowest LR for full transformer fine-tuning
+    weight_decay: 0.05       # Higher weight decay for regularization
+
+  frozen_module_names:
+    - "*aggregator.patch_embed*"     # Only freeze patch embedding
+    - "*camera_head*"                # Freeze camera head
+
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["depth_head"]
+        max_norm: 0.5  # Stricter clipping
+        norm_type: 2
+      - module_name: ["aggregator"]
+        max_norm: 0.3  # Very strict for full transformer
+        norm_type: 2
+
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 2e-7
+              end_value: 2e-5
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 2e-5
+              end_value: 2e-7
+          lengths: [0.2, 0.8]  # 20% warmup, 80% cosine decay
+          interval_scaling: ['rescaled', 'rescaled']
+    weight_decay:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 0.05
+
+max_epochs: 200  # Longest training for full adaptation
+
+accum_steps: 2  # Gradient accumulation for stability
+
+checkpoint:
+  save_freq: 5  # Save even less frequently
+
+# Stricter loss filtering for stable training
+loss:
+  _target_: loss.MultitaskLoss
+  camera:
+    weight: 2.0
+    loss_type: "l1"
+  depth:
+    weight: 5.0
+    gradient_loss_fn: "grad"
+    valid_range: 0.98  # Even stricter outlier filtering
+    use_semantic_weighting: True
+    facade_boost_ratio: 0.3  # Shorter boost period (30%)
+  point: null
+  track: null

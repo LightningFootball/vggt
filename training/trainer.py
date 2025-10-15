@@ -5,6 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+from collections import defaultdict
+from statistics import median
 
 
 # --- Environment Variable Setup for Performance and Debugging ---
@@ -25,11 +27,12 @@ import logging
 import math
 import time
 from datetime import timedelta
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.utils.hooks
 import torchvision
 from hydra.utils import instantiate
 from iopath.common.file_io import g_pathmgr
@@ -41,6 +44,18 @@ from train_utils.general import *
 from train_utils.logging import setup_logging
 from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
 from train_utils.optimizer import construct_optimizers
+
+try:
+    from peft import PeftModel
+    from peft.tuners.lora import LoraLayer
+except ImportError:
+    PeftModel = None  # type: ignore[assignment]
+    LoraLayer = ()  # type: ignore[assignment]
+
+
+class LoRANumericalError(RuntimeError):
+    """Raised when the LoRA guard detects non-finite activations."""
+    pass
 
 
 class Trainer:
@@ -127,6 +142,29 @@ class Trainer:
         # 'where' tracks training progress from 0.0 to 1.0 for schedulers
         self.where = 0.0
 
+        # Guard rails for data anomalies and logging spam control
+        self.enable_batch_sanity_checks = bool(int(os.getenv("VGGT_ENABLE_BATCH_SANITY_CHECKS", "1")))
+        self.bad_batch_log_limit = int(os.getenv("VGGT_BAD_BATCH_LOG_LIMIT", "20"))
+        self._bad_batch_reports = 0
+        self.bad_batch_retry_limit = int(os.getenv("VGGT_BAD_BATCH_RETRY_LIMIT", "1"))
+        self.bad_batch_blacklist: Set[str] = set()
+        self._bad_batch_failures: Dict[str, int] = defaultdict(int)
+
+        self.profile_segments = bool(int(os.getenv("VGGT_PROFILE_TIMING", "0")))
+        if self.profile_segments and not torch.cuda.is_available():
+            logging.warning(
+                "VGGT_PROFILE_TIMING is enabled but CUDA is unavailable; disabling segment profiling."
+            )
+            self.profile_segments = False
+        self._profiling_records = defaultdict(list) if self.profile_segments else None
+        self._iteration_profile_events = []
+        self._current_iteration_profile = None
+        self._nan_guard_handles: List[torch.utils.hooks.RemovableHandle] = []
+        self._nan_guard_triggered: bool = False
+        self._nan_guard_batch_meta: str = "metadata=unavailable"
+        self.lora_guard_max_abs = float(os.getenv("VGGT_LORA_GUARD_MAX_ABS", "25000"))
+        self.enable_cuda_sync_guard = bool(int(os.getenv("VGGT_ENABLE_CUDA_SYNC_GUARD", "1")))
+
         self._setup_device(device)
         self._setup_torch_dist_and_backend(cuda, distributed)
 
@@ -157,12 +195,13 @@ class Trainer:
             self.optims = construct_optimizers(self.model, self.optim_conf)
 
         # Load checkpoint if available or specified
-        if self.checkpoint_conf.resume_checkpoint_path is not None:
+        # First, try to resume from a previously saved training checkpoint
+        ckpt_path = get_resume_checkpoint(self.checkpoint_conf.save_dir)
+        if ckpt_path is not None:
+            self._load_resuming_checkpoint(ckpt_path)
+        elif self.checkpoint_conf.resume_checkpoint_path is not None:
+            # If no training checkpoint exists, load from pretrained model
             self._load_resuming_checkpoint(self.checkpoint_conf.resume_checkpoint_path)
-        else:   
-            ckpt_path = get_resume_checkpoint(self.checkpoint_conf.save_dir)
-            if ckpt_path is not None:
-                self._load_resuming_checkpoint(ckpt_path)
 
         # Wrap the model with DDP
         self._setup_ddp_distributed_training(distributed, device)
@@ -197,6 +236,236 @@ class Trainer:
             timeout=timedelta(minutes=distributed_conf.timeout_mins)
         )
         self.rank = dist.get_rank()
+
+    def _reset_iteration_profile_buffers(self) -> None:
+        if not self.profile_segments:
+            return
+        if self._profiling_records is None:
+            self._profiling_records = defaultdict(list)
+        self._iteration_profile_events = []
+        self._current_iteration_profile = defaultdict(float)
+
+    def _profile_event_start(self, segment: str):
+        if not self.profile_segments or self._current_iteration_profile is None:
+            return None
+        start_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        return segment, start_event
+
+    def _profile_event_end(self, token) -> None:
+        if not self.profile_segments or token is None:
+            return
+        segment, start_event = token
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+        self._iteration_profile_events.append((segment, start_event, end_event))
+
+    def _profile_finalize_iteration(self) -> None:
+        if not self.profile_segments or self._current_iteration_profile is None:
+            return
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError:
+            logging.warning("Failed to synchronize CUDA while finalizing profiling iteration.")
+            return
+
+        for segment, start_event, end_event in self._iteration_profile_events:
+            try:
+                elapsed = start_event.elapsed_time(end_event)
+            except RuntimeError:
+                logging.warning(f"Failed to compute elapsed time for segment {segment}.")
+                continue
+            self._current_iteration_profile[segment] += elapsed
+
+        for segment, total in self._current_iteration_profile.items():
+            self._profiling_records[segment].append(total)
+        self._current_iteration_profile = None
+        self._iteration_profile_events = []
+
+    def _profile_tensor_item(self, tensor: torch.Tensor, label: str) -> float:
+        if not self.profile_segments:
+            return tensor.item()
+        token = self._profile_event_start(f"item:{label}")
+        value = tensor.item()
+        self._profile_event_end(token)
+        return value
+
+    def _profile_tensor_cpu(self, tensor: torch.Tensor, label: str) -> torch.Tensor:
+        if not self.profile_segments:
+            return tensor.cpu()
+        token = self._profile_event_start(f"cpu:{label}")
+        result = tensor.cpu()
+        self._profile_event_end(token)
+        return result
+
+    def _profile_tensor_numpy(self, tensor: torch.Tensor, label: str):
+        if not self.profile_segments:
+            return tensor.numpy()
+        token = self._profile_event_start(f"numpy:{label}")
+        result = tensor.numpy()
+        self._profile_event_end(token)
+        return result
+
+    def _format_batch_metadata(self, batch: Mapping) -> str:
+        """Builds a compact description of key batch identifiers for logging."""
+        parts: List[str] = []
+        seq_name = batch.get("seq_name")
+        if isinstance(seq_name, str):
+            parts.append(f"seq={seq_name}")
+        elif isinstance(seq_name, Sequence):
+            unique_seq = list(dict.fromkeys(seq_name))
+            if unique_seq:
+                preview = unique_seq[:2]
+                if len(unique_seq) > 2:
+                    preview.append("...")
+                parts.append(f"seq={preview}")
+        ids = batch.get("ids")
+        if isinstance(ids, torch.Tensor):
+            try:
+                ids_list = ids.detach().cpu().view(-1).tolist()
+            except RuntimeError:
+                ids_list = None
+        elif isinstance(ids, (list, tuple)):
+            ids_list = list(ids)
+        else:
+            ids_list = None
+        if ids_list:
+            preview = ids_list[:8]
+            if len(ids_list) > 8:
+                preview.append("...")
+            parts.append(f"ids={preview}")
+        frame_num = batch.get("frame_num")
+        if isinstance(frame_num, int):
+            parts.append(f"frames={frame_num}")
+        return ", ".join(parts) if parts else "metadata=unavailable"
+
+    def _log_bad_batch(self, message: str, level: str = "warning") -> None:
+        """Logs bad batch information with optional throttling."""
+        logger_fn = getattr(logging, level, logging.warning)
+        if self.bad_batch_log_limit < 0 or self._bad_batch_reports < self.bad_batch_log_limit:
+            logger_fn(message)
+        elif self._bad_batch_reports == self.bad_batch_log_limit:
+            logger_fn("Bad batch log limit reached; suppressing further messages.")
+        self._bad_batch_reports += 1
+
+    def _record_bad_batch_skip(
+        self,
+        *,
+        phase: str,
+        reason: str,
+        batch: Mapping,
+        log_level: str = "warning",
+        exception: Optional[Exception] = None,
+    ) -> None:
+        """Records that a batch is skipped along with contextual metadata."""
+        iter_idx = self.steps.get(phase, 0) if isinstance(self.steps, Mapping) else 0
+        meta = self._format_batch_metadata(batch)
+        message = f"Skipping {phase} batch (iter={iter_idx}): {reason}. Context: {meta}"
+        if exception is not None:
+            message = f"{message} | Exception: {exception}"
+        self._log_bad_batch(message, level=log_level)
+
+    def _note_bad_batch(self, batch: Mapping, reason: str, meta: Optional[str] = None) -> None:
+        """Track failures per batch and blacklist after exceeding retry limit."""
+        if self.bad_batch_retry_limit == 0:
+            return
+
+        batch_key = meta if meta is not None else self._format_batch_metadata(batch)
+        if not batch_key:
+            return
+
+        self._bad_batch_failures[batch_key] += 1
+        failure_count = self._bad_batch_failures[batch_key]
+
+        logging.debug(
+            "Bad batch note | key=%s | count=%d | reason=%s",
+            batch_key,
+            failure_count,
+            reason,
+        )
+
+        if self.bad_batch_retry_limit > 0 and failure_count >= self.bad_batch_retry_limit:
+            if batch_key not in self.bad_batch_blacklist:
+                self.bad_batch_blacklist.add(batch_key)
+                logging.error(
+                    "Blacklisting batch after %d failures (%s). Future occurrences will be skipped.",
+                    failure_count,
+                    batch_key,
+                )
+
+    def _validate_batch_tensors(
+        self,
+        batch: Mapping,
+    ) -> Tuple[bool, List[Tuple[str, int, List[float]]]]:
+        """Checks for non-finite values inside a batch."""
+        invalid_entries: List[Tuple[str, int, List[float]]] = []
+        if not self.enable_batch_sanity_checks:
+            return True, invalid_entries
+
+        with torch.no_grad():
+            for key, value in batch.items():
+                if torch.is_tensor(value) and value.is_floating_point():
+                    tensor = value.detach()
+                    nonfinite_mask = ~torch.isfinite(tensor)
+                    if nonfinite_mask.any():
+                        count = int(nonfinite_mask.sum().item())
+                        try:
+                            samples = (
+                                tensor[nonfinite_mask]
+                                .reshape(-1)[:3]
+                                .detach()
+                                .cpu()
+                                .tolist()
+                            )
+                        except RuntimeError:
+                            samples = []
+                        invalid_entries.append((key, count, samples))
+
+        return len(invalid_entries) == 0, invalid_entries
+
+    def _handle_step_failure(
+        self,
+        *,
+        phase: str,
+        batch: Mapping,
+        err: Exception,
+        location: str,
+    ) -> None:
+        """Handles failures during forward or backward passes."""
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except RuntimeError:
+                pass
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError:
+                pass
+
+        self._record_bad_batch_skip(
+            phase=phase,
+            reason=f"{location} failure",
+            batch=batch,
+            log_level="error",
+            exception=err,
+        )
+        self._note_bad_batch(batch, f"{location} failure", meta=self._nan_guard_batch_meta)
+
+        for optim in self.optims:
+            optim.zero_grad(set_to_none=True)
+
+    def _log_iteration_profile_stats(self) -> None:
+        if not self.profile_segments or not self._profiling_records:
+            return
+        summary = []
+        for segment, values in self._profiling_records.items():
+            if not values:
+                continue
+            segment_median = median(values) / 1000.0
+            summary.append(f"{segment}: median={segment_median:.6f}s (n={len(values)})")
+        if summary:
+            logging.info("[Timing] CUDA segment medians per iteration -> " + "; ".join(sorted(summary)))
+        self._profiling_records = defaultdict(list)
 
     def _load_resuming_checkpoint(self, ckpt_path: str):
         """Loads a checkpoint from the given path to resume training."""
@@ -257,7 +526,10 @@ class Trainer:
         # Load training progress
         epoch_in_ckpt = checkpoint.get("epoch", checkpoint.get("prev_epoch", None))
         if epoch_in_ckpt is not None:
-            self.epoch = epoch_in_ckpt
+            # Checkpoint contains the completed epoch number
+            # Resume training from the next epoch
+            self.epoch = epoch_in_ckpt + 1
+            logging.info(f"Resuming from epoch {self.epoch} (completed epoch {epoch_in_ckpt})")
         self.steps = checkpoint["steps"] if "steps" in checkpoint else {"train": 0, "val": 0}
         self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
 
@@ -322,6 +594,10 @@ class Trainer:
                 logging.error(f"Failed to apply LoRA: {e}")
                 raise
 
+            self._register_lora_nan_guard()
+
+        self._annotate_module_names()
+
         # Log model summary on rank 0
         if self.rank == 0:
             model_summary_path = os.path.join(self.logging_conf.log_dir, "model.txt")
@@ -362,6 +638,30 @@ class Trainer:
             device_ids=[self.local_rank] if device == "cuda" else [],
             **ddp_options,
         )
+        self._annotate_module_names()
+
+    def _cleanup_dataset_loader(self, dataset: Any, dataset_name: str) -> None:
+        """Shuts down and clears a cached DynamicTorchDataset loader to free memory."""
+        if dataset is None or not hasattr(dataset, "_loader"):
+            return
+
+        loader = getattr(dataset, "_loader", None)
+        if loader is None:
+            return
+
+        try:
+            iterator = getattr(loader, "_iterator", None)
+            if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+                iterator._shutdown_workers()
+
+            if hasattr(loader, "_shutdown_workers"):
+                loader._shutdown_workers()
+        except Exception as exc:
+            logging.warning(f"Failed to shutdown {dataset_name} loader workers: {exc}")
+
+        setattr(dataset, "_loader", None)
+        del loader
+        gc.collect()
 
     def save_checkpoint(self, epoch: int, checkpoint_names: Optional[List[str]] = None):
         """
@@ -447,6 +747,7 @@ class Trainer:
 
             # Clean up memory
             del dataloader
+            self._cleanup_dataset_loader(self.train_dataset, dataset_name="train")
             gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
@@ -455,7 +756,11 @@ class Trainer:
             # Skips validation after the last training epoch, as it can be run separately.
             if self.epoch % self.val_epoch_freq == 0 and self.epoch < self.max_epochs - 1:
                 self.run_val()
-            
+
+                # Training loader has already been cleared prior to validation, but call
+                # helper again to ensure no stale workers remain after val.
+                self._cleanup_dataset_loader(self.train_dataset, dataset_name="train")
+
             self.epoch += 1
         
         self.epoch -= 1
@@ -466,9 +771,26 @@ class Trainer:
             logging.info("No validation dataset configured. Skipping validation.")
             return
 
+        # CRITICAL: Aggressive memory cleanup before validation to prevent OOM
+        # Training leaves ~30GB allocated on GPU, need to free as much as possible
+        logging.info(f"[Pre-validation cleanup] GPU memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        # Force synchronize to ensure all CUDA operations complete
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        logging.info(f"[Post-cleanup] GPU memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+
         dataloader = self.val_dataset.get_loader(epoch=int(self.epoch + self.distributed_rank))
         self.val_epoch(dataloader)
-        
+
+        # Critical: Force cleanup of persistent worker memory
+        # This prevents RAM accumulation in DataLoader workers between val and train epochs
+        self._cleanup_dataset_loader(self.val_dataset, dataset_name="val")
+
         del dataloader
         gc.collect()
         torch.cuda.empty_cache()
@@ -482,13 +804,13 @@ class Trainer:
         mem = AverageMeter("Mem (GB)", self.device, ":.4f")
         data_times = []
         phase = 'val'
-        
+
         loss_names = self._get_scalar_log_keys(phase)
         loss_names = [f"Loss/{phase}_{name}" for name in loss_names]
         loss_meters = {
             name: AverageMeter(name, self.device, ":.4f") for name in loss_names
         }
-        
+
         progress = ProgressMeter(
             num_batches=len(val_loader),
             meters=[
@@ -512,17 +834,24 @@ class Trainer:
             else self.limit_val_batches
         )
 
+        # CRITICAL: Use same chunking as training to prevent OOM
+        # Training uses accum_steps to chunk batches, validation should too
+        val_chunk_size = self.accum_steps if hasattr(self, 'accum_steps') and self.accum_steps > 1 else 1
+        if val_chunk_size > 1:
+            logging.info(f"[Validation] Using batch chunking with chunk_size={val_chunk_size} to reduce memory")
+
         for data_iter, batch in enumerate(val_loader):
             if data_iter > limit_val_batches:
                 break
-            
+
             # measure data loading time
             data_time.update(time.time() - end)
             data_times.append(data_time.val)
-            
+
+            batch = copy_data_to_device(batch, self.device, non_blocking=True)
+
             with torch.amp.autocast('cuda', enabled=False):
                 batch = self._process_batch(batch)
-            batch = copy_data_to_device(batch, self.device, non_blocking=True)
 
             amp_type = self.optim_conf.amp.amp_dtype
             assert amp_type in ["bfloat16", "float16"], f"Invalid Amp type: {amp_type}"
@@ -530,13 +859,24 @@ class Trainer:
                 amp_type = torch.bfloat16
             else:
                 amp_type = torch.float16
-            
-            # compute output
-            with torch.no_grad():
-                with torch.amp.autocast('cuda', enabled=self.optim_conf.amp.enabled, dtype=amp_type):
-                    val_loss_dict = self._step(
-                        batch, self.model, phase, loss_meters
-                    )
+
+            # CRITICAL: Chunk batch to reduce memory usage (same as training)
+            if val_chunk_size > 1:
+                chunked_batches = chunk_batch_for_accum_steps(batch, val_chunk_size)
+            else:
+                chunked_batches = [batch]
+
+            # Process each chunk separately to reduce peak memory
+            for chunk_idx, chunk_batch in enumerate(chunked_batches):
+                with torch.no_grad():
+                    with torch.amp.autocast('cuda', enabled=self.optim_conf.amp.enabled, dtype=amp_type):
+                        val_loss_dict = self._step(
+                            chunk_batch, self.model, phase, loss_meters
+                        )
+
+                # Clean up intermediate tensors between chunks
+                if chunk_idx < len(chunked_batches) - 1:
+                    torch.cuda.empty_cache()
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -600,19 +940,55 @@ class Trainer:
             # setup gradient clipping at the beginning of training
             self.gradient_clipper.setup_clipping(self.model)
 
+        skipped_batches = 0
+
         for data_iter, batch in enumerate(train_loader):
             if data_iter > limit_train_batches:
                 break
+
+            self._reset_iteration_profile_buffers()
             
             # measure data loading time
             data_time.update(time.time() - end)
             data_times.append(data_time.val)
 
-            
+            batch_meta = self._format_batch_metadata(batch)
+            if batch_meta in self.bad_batch_blacklist:
+                failure_count = self._bad_batch_failures.get(batch_meta, 0)
+                self._record_bad_batch_skip(
+                    phase=phase,
+                    reason=f"blacklisted batch (failures={failure_count})",
+                    batch=batch,
+                    log_level="warning",
+                )
+                skipped_batches += 1
+                self._profile_finalize_iteration()
+                continue
+
+            h2d_token = self._profile_event_start("H2D")
+            batch = copy_data_to_device(batch, self.device, non_blocking=True)
+            self._profile_event_end(h2d_token)
+
+            if self.enable_batch_sanity_checks:
+                is_valid, invalid_entries = self._validate_batch_tensors(batch)
+                if not is_valid:
+                    detail_msg = "; ".join(
+                        f"{name}: nonfinite={count}, samples={samples}"
+                        for name, count, samples in invalid_entries
+                    )
+                    self._record_bad_batch_skip(
+                        phase=phase,
+                        reason=f"non-finite tensors detected before forward ({detail_msg})",
+                        batch=batch,
+                        log_level="error",
+                    )
+                    self._note_bad_batch(batch, "non-finite tensors before forward", meta=batch_meta)
+                    skipped_batches += 1
+                    self._profile_finalize_iteration()
+                    continue
+
             with torch.amp.autocast('cuda', enabled=False):
                 batch = self._process_batch(batch)
-
-            batch = copy_data_to_device(batch, self.device, non_blocking=True)
 
             accum_steps = self.accum_steps
 
@@ -621,9 +997,17 @@ class Trainer:
             else:
                 chunked_batches = chunk_batch_for_accum_steps(batch, accum_steps)
 
-            self._run_steps_on_batch_chunks(
+            batch_success = self._run_steps_on_batch_chunks(
                 chunked_batches, phase, loss_meters
             )
+
+            # If batch had NaN/Inf, skip optimizer step and continue to next batch
+            if not batch_success:
+                logging.warning(f"Skipping optimizer step for iteration {data_iter} due to NaN/Inf loss")
+                self._note_bad_batch(batch, "forward/backward failure", meta=batch_meta)
+                skipped_batches += 1
+                self._profile_finalize_iteration()
+                continue
 
             # compute gradient and do SGD step
             assert data_iter <= limit_train_batches  # allow for off by one errors
@@ -664,6 +1048,7 @@ class Trainer:
                     self.steps[phase],
                 )
 
+            optim_step_token = self._profile_event_start("optimizer.step")
             # Clipping gradients and detecting diverging gradients
             if self.gradient_clipper is not None:
                 for optim in self.optims:
@@ -678,6 +1063,19 @@ class Trainer:
             for optim in self.optims:   
                 self.scaler.step(optim.optimizer)
             self.scaler.update()
+            self._profile_event_end(optim_step_token)
+
+            if not self._cuda_sync_safely(
+                phase=phase,
+                batch=batch,
+                location="post_optimizer_step_sync",
+            ):
+                self._note_bad_batch(batch, "cuda sync failure", meta=batch_meta)
+                skipped_batches += 1
+                self._profile_finalize_iteration()
+                continue
+
+            self._profile_finalize_iteration()
 
             # Measure elapsed time
             batch_time.update(time.time() - end)
@@ -690,6 +1088,12 @@ class Trainer:
             if data_iter % self.logging_conf.log_freq == 0:
                 progress.display(data_iter)
 
+        if skipped_batches > 0:
+            logging.info(
+                f"Epoch {self.epoch} skipped {skipped_batches} {phase} batches due to anomalies."
+            )
+
+        self._log_iteration_profile_stats()
         return True
 
     def _run_steps_on_batch_chunks(
@@ -697,14 +1101,19 @@ class Trainer:
         chunked_batches: List[Any],
         phase: str,
         loss_meters: Dict[str, AverageMeter],
-    ):
+    ) -> bool:
         """
         Run the forward / backward as many times as there are chunks in the batch,
         accumulating the gradients on each backward
-        """        
-        
-        for optim in self.optims:   
+
+        Returns:
+            True if successful, False if NaN/Inf detected (skip this batch)
+        """
+
+        zero_grad_token = self._profile_event_start("optimizer.zero_grad")
+        for optim in self.optims:
             optim.zero_grad(set_to_none=True)
+        self._profile_event_end(zero_grad_token)
 
         accum_steps = len(chunked_batches)
 
@@ -714,8 +1123,9 @@ class Trainer:
             amp_type = torch.bfloat16
         else:
             amp_type = torch.float16
-        
+        self._nan_guard_triggered = False
         for i, chunked_batch in enumerate(chunked_batches):
+            self._nan_guard_batch_meta = self._format_batch_metadata(chunked_batch)
             ddp_context = (
                 self.model.no_sync()
                 if i < accum_steps - 1
@@ -724,23 +1134,67 @@ class Trainer:
 
             with ddp_context:
                 with torch.amp.autocast('cuda', enabled=self.optim_conf.amp.enabled, dtype=amp_type):
-                    loss_dict = self._step(
-                        chunked_batch, self.model, phase, loss_meters
-                    )
+                    try:
+                        loss_dict = self._step(
+                            chunked_batch, self.model, phase, loss_meters
+                        )
+                    except (RuntimeError, FloatingPointError) as err:
+                        self._handle_step_failure(
+                            phase=phase,
+                            batch=chunked_batch,
+                            err=err,
+                            location="forward/loss",
+                        )
+                        return False
 
+            if not self._cuda_sync_safely(
+                phase=phase,
+                batch=chunked_batch,
+                location="post_forward_sync",
+            ):
+                return False
 
-                loss = loss_dict["objective"]
-                loss_key = f"Loss/{phase}_loss_objective"
-                batch_size = chunked_batch["images"].shape[0]
+            loss_tensor = loss_dict["objective"]
+            loss_key = f"Loss/{phase}_loss_objective"
+            batch_size = chunked_batch["images"].shape[0]
 
-                if not math.isfinite(loss.item()):
-                    error_msg = f"Loss is {loss.item()}, attempting to stop training"
-                    logging.error(error_msg)
-                    return
+            loss_value = self._profile_tensor_item(loss_tensor, "loss_check")
 
-                loss /= accum_steps
-                self.scaler.scale(loss).backward()
-                loss_meters[loss_key].update(loss.item(), batch_size)
+            if not math.isfinite(loss_value):
+                error_msg = f"Loss is {loss_value}, skipping this batch and zeroing gradients"
+                logging.warning(error_msg)
+                self._note_bad_batch(chunked_batch, "non-finite loss value", meta=self._nan_guard_batch_meta)
+                # Zero out gradients to avoid corrupted gradient state
+                for optim in self.optims:
+                    optim.zero_grad(set_to_none=True)
+                return False
+            loss = loss_tensor / accum_steps
+            try:
+                backward_token = self._profile_event_start("backward")
+                try:
+                    self.scaler.scale(loss).backward()
+                finally:
+                    self._profile_event_end(backward_token)
+            except RuntimeError as err:
+                self._handle_step_failure(
+                    phase=phase,
+                    batch=chunked_batch,
+                    err=err,
+                    location="backward",
+                )
+                return False
+            loss_meter_value = self._profile_tensor_item(loss, "loss_meter")
+
+            if not self._cuda_sync_safely(
+                phase=phase,
+                batch=chunked_batch,
+                location="post_backward_sync",
+            ):
+                return False
+
+            loss_meters[loss_key].update(loss_meter_value, batch_size)
+
+        return True
 
 
     def _apply_batch_repetition(self, batch: Mapping) -> Mapping:
@@ -804,10 +1258,18 @@ class Trainer:
             A dictionary containing the computed losses.
         """
         # Forward pass
-        y_hat = model(images=batch["images"])
+        forward_token = self._profile_event_start("forward")
+        try:
+            y_hat = model(images=batch["images"])
+        finally:
+            self._profile_event_end(forward_token)
         
         # Loss computation
-        loss_dict = self.loss(y_hat, batch)
+        loss_token = self._profile_event_start("loss")
+        try:
+            loss_dict = self.loss(y_hat, batch)
+        finally:
+            self._profile_event_end(loss_token)
         
         # Combine all data for logging
         log_data = {**y_hat, **loss_dict, **batch}
@@ -818,6 +1280,160 @@ class Trainer:
         self.steps[phase] += 1
         return loss_dict
 
+    def _reset_amp_scaler(self) -> None:
+        """Re-initializes the AMP scaler to avoid propagating NaNs."""
+        if not isinstance(self.scaler, torch.cuda.amp.GradScaler):
+            return
+        if not self.optim_conf.amp.enabled:
+            return
+        self.scaler = torch.cuda.amp.GradScaler(enabled=True)
+        logging.warning("AMP GradScaler has been reset due to LoRA numerical instability.")
+
+    def _cuda_sync_safely(
+        self,
+        *,
+        phase: str,
+        batch: Mapping,
+        location: str,
+    ) -> bool:
+        """
+        Forces CUDA synchronization to surface asynchronous kernel errors.
+
+        Returns:
+            True if synchronization succeeded or guard disabled. False otherwise.
+        """
+        if not self.enable_cuda_sync_guard or not torch.cuda.is_available():
+            return True
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError as err:
+            self._handle_step_failure(
+                phase=phase,
+                batch=batch,
+                err=err,
+                location=location,
+            )
+            return False
+        return True
+
+    def _register_lora_nan_guard(self) -> None:
+        """Installs forward hooks on LoRA-targeted modules to detect non-finite activations."""
+        if PeftModel is None or not isinstance(self.model, PeftModel):
+            logging.debug("Skipping LoRA NaN guard registration: model is not a PeftModel.")
+            return
+
+        guard_modules: List[str] = []
+        for name, module in self.model.named_modules():
+            if self._module_has_lora(module):
+                handle = module.register_forward_hook(self._make_nan_guard_hook(name))
+                self._nan_guard_handles.append(handle)
+                guard_modules.append(name)
+
+        if guard_modules:
+            logging.info(
+                "Registered LoRA runtime guard on %d modules (rank %d). Examples: %s",
+                len(guard_modules),
+                self.rank,
+                ", ".join(guard_modules[:5]),
+            )
+        else:
+            logging.warning("No LoRA-aware modules found for runtime guard registration.")
+
+    @staticmethod
+    def _module_has_lora(module: nn.Module) -> bool:
+        if isinstance(LoraLayer, tuple) and len(LoraLayer) == 0:
+            return hasattr(module, "lora_A") or hasattr(module, "lora_embedding_A")
+        return isinstance(module, LoraLayer)  # type: ignore[arg-type]
+
+    def _make_nan_guard_hook(self, module_name: str) -> Callable:
+        """Creates a forward hook that checks for NaN/Inf outputs."""
+
+        def hook(module: nn.Module, inputs: Tuple[Any, ...], output: Any) -> None:
+            if self._nan_guard_triggered:
+                return
+
+            issues: List[str] = []
+            magnitudes_exceeded: List[str] = []
+            with torch.no_grad():
+                for idx, tensor in enumerate(self._iter_tensors(output)):
+                    if tensor.numel() == 0 or not tensor.is_floating_point():
+                        continue
+                    detached = tensor.detach()
+                    mask = ~torch.isfinite(detached)
+                    if mask.any():
+                        sample_values = (
+                            detached[mask].reshape(-1)[:3].cpu().tolist()
+                        )
+                        issues.append(
+                            f"idx={idx}, shape={tuple(detached.shape)}, samples={sample_values}"
+                        )
+                        continue
+
+                    max_abs = detached.abs().max()
+                    if torch.isfinite(max_abs) and max_abs > self.lora_guard_max_abs:
+                        magnitudes_exceeded.append(
+                            f"idx={idx}, shape={tuple(detached.shape)}, max_abs={float(max_abs)}"
+                        )
+
+            if issues or magnitudes_exceeded:
+                self._nan_guard_triggered = True
+                self._handle_lora_guard_alert(
+                    module_name,
+                    nonfinite=issues,
+                    overflow=magnitudes_exceeded,
+                )
+                reason = issues[0] if issues else magnitudes_exceeded[0]
+                raise LoRANumericalError(
+                    f"LoRA guard triggered in module '{module_name}': {reason}"
+                )
+
+        return hook
+
+    @staticmethod
+    def _iter_tensors(obj: Any):
+        if torch.is_tensor(obj):
+            yield obj
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                yield from Trainer._iter_tensors(item)
+        elif isinstance(obj, Mapping):
+            for item in obj.values():
+                yield from Trainer._iter_tensors(item)
+
+    def _handle_lora_guard_alert(
+        self,
+        module_name: str,
+        *,
+        nonfinite: List[str],
+        overflow: List[str],
+    ) -> None:
+        """Logs the offending batch/module and resets state to keep training alive."""
+        reasons = []
+        if nonfinite:
+            reasons.append(f"non-finite: {', '.join(nonfinite[:3])}")
+        if overflow:
+            reasons.append(f"magnitude>{self.lora_guard_max_abs}: {', '.join(overflow[:3])}")
+        reason_text = " | ".join(reasons) if reasons else "unknown"
+        logging.error(
+            "Detected unstable LoRA activations in module '%s' | Batch: %s | "
+            "Details: %s",
+            module_name,
+            self._nan_guard_batch_meta,
+            reason_text,
+        )
+        self._reset_amp_scaler()
+
+    def _annotate_module_names(self) -> None:
+        """Attach hierarchical names to modules for improved debug logging."""
+        module_iter = self.model.named_modules()
+        for name, module in module_iter:
+            debug_name = name if name else module.__class__.__name__
+            try:
+                setattr(module, "_debug_name", debug_name)
+            except AttributeError:
+                continue
+
+
     def _update_and_log_scalars(self, data: Mapping, phase: str, step: int, loss_meters: dict):
         """Updates average meters and logs scalar values to TensorBoard."""
         keys_to_log = self._get_scalar_log_keys(phase)
@@ -825,7 +1441,10 @@ class Trainer:
         
         for key in keys_to_log:
             if key in data:
-                value = data[key].item() if torch.is_tensor(data[key]) else data[key]
+                if torch.is_tensor(data[key]):
+                    value = self._profile_tensor_item(data[key], f"scalar:{key}")
+                else:
+                    value = data[key]
                 loss_meters[f"Loss/{phase}_{key}"].update(value, batch_size)
                 if step % self.logging_conf.log_freq == 0 and self.rank == 0:
                     self.tb_writer.log(f"Values/{phase}/{key}", value, step)
@@ -912,10 +1531,10 @@ class Trainer:
 
             visuals_to_log = torchvision.utils.make_grid(grids, nrow=1).clamp(-1, 1)
 
-            visuals_to_log = visuals_to_log.cpu()
+            visuals_to_log = self._profile_tensor_cpu(visuals_to_log, "visuals")
             if visuals_to_log.dtype == torch.bfloat16:
                 visuals_to_log = visuals_to_log.to(torch.float16)
-            visuals_to_log = visuals_to_log.numpy()
+            visuals_to_log = self._profile_tensor_numpy(visuals_to_log, "visuals")
 
             self.tb_writer.log_visuals(
                 name, visuals_to_log, step, self.logging_conf.video_logging_fps

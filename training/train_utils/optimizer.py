@@ -6,12 +6,14 @@
 
 import logging
 import itertools
-from typing import Any, Dict, List, Mapping, Iterable, Set, Tuple, Union
+import re
+from typing import Any, Dict, Iterable, List, Mapping, Set, Union
 
 import hydra
 import torch
 import torch.nn as nn
 from torch import Tensor
+from omegaconf import OmegaConf
 
 # -----------------------------------------------------------------------------
 # Optimizer wrapper
@@ -205,10 +207,106 @@ def map_scheduler_cfgs_to_param_groups(all_scheduler_cfgs: Iterable[List[dict]],
 # -----------------------------------------------------------------------------
 
 
+def _resolve_conf(conf):
+    if conf is None:
+        return None
+    if OmegaConf.is_config(conf):
+        return OmegaConf.to_container(conf, resolve=True)
+    return conf
+
+
+def _build_zero_weight_decay_param_groups(
+    *,
+    named_parameters: Dict[str, Tensor],
+    optimizer_conf: Any,
+    strategy_conf: Mapping[str, Any],
+) -> Union[None, List[Dict[str, Any]]]:
+    """Create param groups that apply zero weight decay to bias/norm/LoRA parameters."""
+    strategy_conf = _resolve_conf(strategy_conf)
+    if not strategy_conf:
+        return None
+
+    zero_wd_conf = strategy_conf.get("zero_weight_decay")
+    if not zero_wd_conf:
+        return None
+    if isinstance(zero_wd_conf, bool):
+        if not zero_wd_conf:
+            return None
+        zero_wd_conf = {}
+    zero_wd_conf = dict(zero_wd_conf)
+
+    apply_bias = bool(zero_wd_conf.get("bias", True))
+    apply_norm = bool(zero_wd_conf.get("norm", True))
+    apply_lora = bool(zero_wd_conf.get("lora", True))
+    extra_patterns: List[str] = list(zero_wd_conf.get("patterns", []))
+    norm_keywords: List[str] = [
+        keyword.lower() for keyword in zero_wd_conf.get("norm_keywords", ["norm", "bn"])
+    ]
+    lora_keywords: List[str] = [
+        keyword.lower() for keyword in zero_wd_conf.get("lora_keywords", ["lora"])
+    ]
+
+    optimizer_defaults = _resolve_conf(optimizer_conf) or {}
+    base_lr = optimizer_defaults.get("lr")
+    base_weight_decay = optimizer_defaults.get("weight_decay", 0.0)
+
+    decay_params: List[Tensor] = []
+    zero_decay_params: List[Tensor] = []
+
+    for name, param in named_parameters.items():
+        lower_name = name.lower()
+
+        def _matches(patterns: List[str]) -> bool:
+            return any(pattern in lower_name for pattern in patterns)
+
+        def _extra_matches(pattern_list: List[str]) -> bool:
+            return any(re.search(pattern, name) for pattern in pattern_list)
+
+        is_bias = name.endswith(".bias")
+        is_norm_like = param.ndim <= 1 or _matches(norm_keywords)
+        is_lora = _matches(lora_keywords)
+
+        if (
+            (apply_lora and is_lora)
+            or (apply_bias and is_bias)
+            or (apply_norm and is_norm_like)
+            or _extra_matches(extra_patterns)
+        ):
+            zero_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    if not decay_params and not zero_decay_params:
+        return None
+
+    param_groups: List[Dict[str, Any]] = []
+
+    if decay_params:
+        group = {"params": decay_params}
+        if base_lr is not None:
+            group["lr"] = base_lr
+        group["weight_decay"] = base_weight_decay
+        param_groups.append(group)
+
+    if zero_decay_params:
+        group = {"params": zero_decay_params, "weight_decay": 0.0}
+        if base_lr is not None:
+            group["lr"] = base_lr
+        param_groups.append(group)
+
+    logging.info(
+        "Optimizer param grouping applied: %d decay params, %d zero-wd params.",
+        len(decay_params),
+        len(zero_decay_params),
+    )
+    return param_groups
+
+
 def construct_optimizer(model: nn.Module,
                         optimizer_conf: Any,
                         options_conf: Union[Mapping[str, List], None] = None,
                         param_group_modifiers_conf: Union[List, None] = None,
+                        param_groups_conf: Union[Mapping[str, Any], None] = None,
                         validate_param_groups: bool = True) -> OptimizerWrapper:
     """Build an OptimizerWrapper from hydra configs.
 
@@ -223,7 +321,20 @@ def construct_optimizer(model: nn.Module,
     # No scheduler case – simple & fast
     # ──────────────────────────────────────────────────────────────────
     if not options_conf:
-        optimizer = hydra.utils.instantiate(optimizer_conf, named_parameters.values())
+        param_groups = None
+        if param_groups_conf:
+            param_groups = _build_zero_weight_decay_param_groups(
+                named_parameters=named_parameters,
+                optimizer_conf=optimizer_conf,
+                strategy_conf=param_groups_conf,
+            )
+            if param_groups and validate_param_groups:
+                validate_param_group_params(param_groups, model)
+
+        if param_groups:
+            optimizer = hydra.utils.instantiate(optimizer_conf, param_groups)
+        else:
+            optimizer = hydra.utils.instantiate(optimizer_conf, named_parameters.values())
         return OptimizerWrapper(optimizer)
 
     # ──────────────────────────────────────────────────────────────────
@@ -264,10 +375,16 @@ def construct_optimizers(model: nn.Module, optim_conf) -> Union[List[OptimizerWr
     if optim_conf is None:
         return None
 
+    options_conf = getattr(optim_conf, "options", None)
+    param_group_modifiers_conf = getattr(optim_conf, "param_group_modifiers", None)
+    param_groups_conf = getattr(optim_conf, "param_groups", None)
+
     optimizer = construct_optimizer(
         model,
         optim_conf.optimizer,
-        optim_conf.options,
+        options_conf,
+        param_group_modifiers_conf,
+        param_groups_conf,
         validate_param_groups=True,
     )
     return [optimizer]
