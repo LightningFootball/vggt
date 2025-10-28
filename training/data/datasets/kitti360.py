@@ -74,9 +74,12 @@ class KITTI360Dataset(BaseDataset):
 
     Args:
         root_dir: Path to KITTI-360 dataset root
-        split: 'train' or 'val'
+        split: 'train', 'val', or 'test'
+            - 'train': Training frames from training sequences
+            - 'val': Validation frames from training sequences
+            - 'test': Test sequences (0008, 0018) for final evaluation
         common_conf: Common configuration object from training config
-        sequences: List of sequence names (if None, use all train sequences)
+        sequences: List of sequence names (if None, auto-select based on split)
         sampling_strategy: 'adaptive' (建筑分类采样) or 'uniform'
         building_sampling_weights: Tuple of (rich, mixed, road) sampling weights
         accumulation_frames: Number of frames to accumulate for LiDAR (±N frames)
@@ -89,7 +92,7 @@ class KITTI360Dataset(BaseDataset):
         len_test: Dataset length for testing
     """
 
-    # All KITTI-360 training sequences
+    # All KITTI-360 training sequences (for train/val split)
     ALL_SEQUENCES = [
         '2013_05_28_drive_0000_sync',
         '2013_05_28_drive_0002_sync',
@@ -100,6 +103,12 @@ class KITTI360Dataset(BaseDataset):
         '2013_05_28_drive_0007_sync',
         '2013_05_28_drive_0009_sync',
         '2013_05_28_drive_0010_sync',
+    ]
+
+    # KITTI-360 test sequences (held-out for final evaluation)
+    TEST_SEQUENCES = [
+        '2013_05_28_drive_0008_sync',
+        '2013_05_28_drive_0018_sync',
     ]
 
     def __init__(
@@ -119,6 +128,8 @@ class KITTI360Dataset(BaseDataset):
         len_train: int = 50000,
         len_test: int = 5000,
         camera_id: int = 0,  # 0 for image_00 (left), 1 for image_01 (right)
+        use_precomputed: bool = True,  # 🆕 Enable precomputed data loading
+        precomputed_dir: Optional[str] = None,  # 🆕 Custom precomputed directory
         dataset_configs=None,  # Ignored, for compatibility with DynamicTorchDataset
         **kwargs,  # Accept and ignore any additional parameters
     ):
@@ -154,12 +165,26 @@ class KITTI360Dataset(BaseDataset):
 
         # Depth configuration
         self.min_depth, self.max_depth = depth_range
+        self.depth_range = depth_range  # Store for config validation
 
         # Dataset length
         self.len_train = len_train if split == 'train' else len_test
 
-        # Select sequences
-        self.sequences = sequences if sequences is not None else self.ALL_SEQUENCES
+        # Select sequences based on split
+        if sequences is not None:
+            self.sequences = sequences
+        elif split == 'test':
+            self.sequences = self.TEST_SEQUENCES
+        else:
+            self.sequences = self.ALL_SEQUENCES
+
+        # 🆕 Setup precomputed data paths
+        self.use_precomputed = use_precomputed
+        self.precomputed_available = False
+
+        if use_precomputed:
+            self._setup_precomputed_paths(precomputed_dir)
+            self._validate_precomputed_config()
 
         # Load calibration (shared across all sequences)
         self.calib = self._load_calibration()
@@ -176,31 +201,40 @@ class KITTI360Dataset(BaseDataset):
                 'num_frames': len(seq_frames),
             }
 
-        # Load train/val split from official annotation
-        self.train_frame_list, self.val_frame_list = self._load_official_split()
+        # Filter frames by split (only for train/val, not test)
+        if split != 'test':
+            # Load train/val split from official annotation
+            self.train_frame_list, self.val_frame_list = self._load_official_split()
 
-        # Filter frames by split
-        if split == 'train':
-            self.frames = [f for f in self.frames if self._get_frame_key(f) in self.train_frame_list]
+            # Filter frames by split
+            if split == 'train':
+                self.frames = [f for f in self.frames if self._get_frame_key(f) in self.train_frame_list]
+            else:  # split == 'val'
+                self.frames = [f for f in self.frames if self._get_frame_key(f) in self.val_frame_list]
+
+            # Rebuild sequence metadata after filtering
+            self.sequence_metadata = {}
+            current_idx = 0
+            for seq_name in self.sequences:
+                seq_frames = [f for f in self.frames if f['sequence'] == seq_name]
+                if len(seq_frames) > 0:
+                    self.sequence_metadata[seq_name] = {
+                        'start_idx': current_idx,
+                        'end_idx': current_idx + len(seq_frames),
+                        'num_frames': len(seq_frames),
+                    }
+                    current_idx += len(seq_frames)
         else:
-            self.frames = [f for f in self.frames if self._get_frame_key(f) in self.val_frame_list]
+            # For test split, no filtering needed (use all frames from test sequences)
+            self.train_frame_list = set()
+            self.val_frame_list = set()
 
-        # Rebuild sequence metadata after filtering
-        self.sequence_metadata = {}
-        current_idx = 0
-        for seq_name in self.sequences:
-            seq_frames = [f for f in self.frames if f['sequence'] == seq_name]
-            if len(seq_frames) > 0:
-                self.sequence_metadata[seq_name] = {
-                    'start_idx': current_idx,
-                    'end_idx': current_idx + len(seq_frames),
-                    'num_frames': len(seq_frames),
-                }
-                current_idx += len(seq_frames)
-
-        # Build sampling buckets (for adaptive sampling)
+        # 🆕 Build sampling buckets (use precomputed if available)
         if sampling_strategy == 'adaptive':
-            self._build_sampling_buckets()
+            if self.precomputed_available and hasattr(self, 'base_dir'):
+                self._load_precomputed_buckets()
+            else:
+                self._build_sampling_buckets()
 
         logger.info(f"KITTI-360 {split}: Loaded {len(self.frames)} frames from {len(self.sequences)} sequences")
         logger.info(f"Sampling strategy: {sampling_strategy}")
@@ -269,7 +303,18 @@ class KITTI360Dataset(BaseDataset):
 
     def _load_sequence(self, seq_name: str) -> List[Dict]:
         """Load all frames from a sequence"""
-        seq_dir = os.path.join(self.root_dir, 'data_2d_raw', seq_name)
+        # Determine if this is a test sequence
+        is_test = seq_name in self.TEST_SEQUENCES
+
+        # Select appropriate data directory based on sequence type
+        if is_test:
+            data_dir = 'data_2d_test'
+            semantic_dir = 'data_2d_semantics_test'  # May not exist for test
+        else:
+            data_dir = 'data_2d_raw'
+            semantic_dir = 'data_2d_semantics'
+
+        seq_dir = os.path.join(self.root_dir, data_dir, seq_name)
         image_dir = os.path.join(seq_dir, self.camera_name, 'data_rect')
 
         if not os.path.exists(image_dir):
@@ -295,8 +340,15 @@ class KITTI360Dataset(BaseDataset):
             img_path = os.path.join(image_dir, img_file)
             lidar_path = os.path.join(self.root_dir, 'data_3d_raw', seq_name,
                                      'velodyne_points', 'data', f'{frame_idx:010d}.bin')
-            semantic_path = os.path.join(self.root_dir, 'data_2d_semantics', 'train',
-                                        seq_name, self.camera_name, 'semantic', f'{frame_idx:010d}.png')
+
+            # Semantic path differs for train vs test
+            if is_test:
+                # Test sequences may not have semantic labels
+                semantic_path = os.path.join(self.root_dir, semantic_dir, seq_name,
+                                           self.camera_name, 'semantic', f'{frame_idx:010d}.png')
+            else:
+                semantic_path = os.path.join(self.root_dir, semantic_dir, 'train',
+                                           seq_name, self.camera_name, 'semantic', f'{frame_idx:010d}.png')
 
             # Check if required files exist
             if not os.path.exists(img_path) or not os.path.exists(lidar_path):
@@ -384,6 +436,184 @@ class KITTI360Dataset(BaseDataset):
     def _get_frame_key(self, frame: Dict) -> Tuple[str, str, int]:
         """Get unique key for frame in official split"""
         return (frame['sequence'], self.camera_name, frame['frame_idx'])
+
+    # ==================== 🆕 Precomputed Data Methods ====================
+
+    def _setup_precomputed_paths(self, precomputed_dir: Optional[str]):
+        """Setup paths for precomputed data."""
+        import json
+
+        if precomputed_dir is None:
+            # Auto-discover: <root_dir>/precomputed/vggt_lora
+            precomputed_base = os.path.join(self.root_dir, 'precomputed', 'vggt_lora')
+        else:
+            precomputed_base = precomputed_dir
+
+        # Base layer (shared)
+        self.base_dir = os.path.join(precomputed_base, 'base')
+
+        # Depth layer (config-specific)
+        config_id = f"cam{self.camera_id:02d}_af{self.accumulation_frames}_dr{self.depth_range[0]}-{self.depth_range[1]}"
+        self.depth_dir = os.path.join(precomputed_base, 'depths', config_id)
+
+        logger.info(f"Precomputed data paths:")
+        logger.info(f"  Base dir:  {self.base_dir}")
+        logger.info(f"  Depth dir: {self.depth_dir}")
+
+    def _validate_precomputed_config(self):
+        """Validate precomputed data exists and matches current config."""
+        import json
+
+        # Check if depth directory exists
+        if not os.path.exists(self.depth_dir):
+            logger.warning(f"⚠️  Precomputed depth directory not found: {self.depth_dir}")
+            logger.warning(f"   Falling back to online processing")
+            self.use_precomputed = False
+            return
+
+        # Check if meta.json exists
+        meta_path = os.path.join(self.depth_dir, 'meta.json')
+        if not os.path.exists(meta_path):
+            logger.warning(f"⚠️  Precomputed metadata not found: {meta_path}")
+            logger.warning(f"   Falling back to online processing")
+            self.use_precomputed = False
+            return
+
+        # Load and validate metadata
+        with open(meta_path, 'r') as f:
+            meta = json.load(f)
+
+        params = meta.get('parameters', {})
+
+        # Validate critical parameters
+        mismatches = []
+        if params.get('camera_id') != self.camera_id:
+            mismatches.append(f"camera_id: {params.get('camera_id')} != {self.camera_id}")
+        if params.get('accumulation_frames') != self.accumulation_frames:
+            mismatches.append(f"accumulation_frames: {params.get('accumulation_frames')} != {self.accumulation_frames}")
+        if tuple(params.get('depth_range', [])) != self.depth_range:
+            mismatches.append(f"depth_range: {params.get('depth_range')} != {list(self.depth_range)}")
+
+        if mismatches:
+            logger.warning(f"⚠️  Precomputed data config mismatch:")
+            for mismatch in mismatches:
+                logger.warning(f"     {mismatch}")
+            logger.warning(f"   Falling back to online processing")
+            self.use_precomputed = False
+            return
+
+        # All checks passed
+        self.precomputed_available = True
+        logger.info(f"✅ Using precomputed depths from {self.depth_dir}")
+        logger.info(f"   Config hash: {meta.get('config_hash', 'N/A')}")
+
+    def _load_precomputed_buckets(self):
+        """Load precomputed sampling buckets."""
+        import json
+
+        buckets_path = os.path.join(self.base_dir, 'buckets.json')
+
+        if not os.path.exists(buckets_path):
+            logger.warning(f"⚠️  Precomputed buckets not found: {buckets_path}")
+            logger.warning(f"   Building buckets online...")
+            self._build_sampling_buckets()
+            return
+
+        with open(buckets_path, 'r') as f:
+            buckets = json.load(f)
+
+        # Convert to indices in self.frames
+        # Precomputed buckets use (sequence, camera, frame_idx) tuples
+        frame_to_idx = {}
+        for idx, frame in enumerate(self.frames):
+            key = (frame['sequence'], self.camera_name, frame['frame_idx'])
+            frame_to_idx[key] = idx
+
+        self.bucket_building_rich = []
+        self.bucket_mixed = []
+        self.bucket_road = []
+
+        for bucket_key in buckets.get('rich', []):
+            key = tuple(bucket_key)  # Convert from list to tuple
+            if key in frame_to_idx:
+                self.bucket_building_rich.append(frame_to_idx[key])
+
+        for bucket_key in buckets.get('mixed', []):
+            key = tuple(bucket_key)
+            if key in frame_to_idx:
+                self.bucket_mixed.append(frame_to_idx[key])
+
+        for bucket_key in buckets.get('road', []):
+            key = tuple(bucket_key)
+            if key in frame_to_idx:
+                self.bucket_road.append(frame_to_idx[key])
+
+        logger.info(f"✅ Loaded precomputed buckets from {buckets_path}")
+
+    def _load_precomputed_depth(self, sequence: str, frame_idx: int, target_shape: Tuple[int, int]) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Load precomputed accumulated depth map.
+
+        Args:
+            sequence: Sequence name
+            frame_idx: Frame index
+            target_shape: (H, W) target shape for resizing
+
+        Returns:
+            (depth_map, depth_mask) or None if not available
+        """
+        if not self.precomputed_available:
+            return None
+
+        depth_path = os.path.join(self.depth_dir, 'sequences', sequence, f'{frame_idx:010d}.npz')
+
+        if not os.path.exists(depth_path):
+            return None
+
+        try:
+            data = np.load(depth_path)
+            depth_map = data['depth']
+            depth_mask = data['mask']
+
+            # Resize if needed
+            H, W = target_shape
+            if depth_map.shape[:2] != (H, W):
+                depth_map = cv2.resize(depth_map, (W, H), interpolation=cv2.INTER_LINEAR)
+                depth_mask = cv2.resize(depth_mask.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+            return depth_map, depth_mask
+
+        except Exception as e:
+            logger.warning(f"Failed to load precomputed depth from {depth_path}: {e}")
+            return None
+
+    def _get_precomputed_valid_count(self, sequence: str, frame_idx: int) -> Optional[int]:
+        """
+        Get precomputed valid point count (fast check without loading full depth map).
+
+        Args:
+            sequence: Sequence name
+            frame_idx: Frame index
+
+        Returns:
+            valid_count or None if not available
+        """
+        if not self.precomputed_available:
+            return None
+
+        depth_path = os.path.join(self.depth_dir, 'sequences', sequence, f'{frame_idx:010d}.npz')
+
+        if not os.path.exists(depth_path):
+            return None
+
+        try:
+            data = np.load(depth_path)
+            return int(data['valid_count'])
+        except Exception as e:
+            logger.warning(f"Failed to load valid_count from {depth_path}: {e}")
+            return None
+
+    # ==================== Original Methods ====================
 
     def _build_sampling_buckets(self):
         """Build sampling buckets based on building ratio"""
@@ -673,11 +903,17 @@ class KITTI360Dataset(BaseDataset):
                 frame_indices[0] = anchor_idx
 
             # Quick check: verify anchor frame has sufficient depth
-            # (full check happens later during processing)
-            anchor_depth_map, anchor_depth_mask = self._project_lidar_to_depth(
-                anchor_frame, anchor_idx, np.array([1080, 1920])  # Use original size for check
+            # 🆕 Try to use precomputed valid_count for fast check
+            anchor_valid_count = self._get_precomputed_valid_count(
+                anchor_frame['sequence'], anchor_frame['frame_idx']
             )
-            anchor_valid_count = anchor_depth_mask.sum()
+
+            if anchor_valid_count is None:
+                # Fallback to online computation
+                anchor_depth_map, anchor_depth_mask = self._project_lidar_to_depth(
+                    anchor_frame, anchor_idx, np.array([1080, 1920])  # Use original size for check
+                )
+                anchor_valid_count = anchor_depth_mask.sum()
 
             if anchor_valid_count >= self.min_valid_points:
                 break  # Good anchor frame
@@ -714,13 +950,18 @@ class KITTI360Dataset(BaseDataset):
             image = read_image_cv2(frame['image_path'])
             original_size = np.array(image.shape[:2])
 
-            # Load or generate depth
-            # Accumulate LiDAR from nearby frames
-            # Note: nearby_indices are local to current sequence, not global frame indices
-            # We pass frame indices to _project_lidar_to_depth which handles sequence bounds
-            depth_map, depth_mask = self._project_lidar_to_depth(
-                frame, idx, original_size
+            # 🆕 Load depth: try precomputed first, fallback to online computation
+            depth_result = self._load_precomputed_depth(
+                frame['sequence'], frame['frame_idx'], tuple(original_size)
             )
+
+            if depth_result is not None:
+                depth_map, depth_mask = depth_result
+            else:
+                # Fallback: accumulate LiDAR from nearby frames
+                depth_map, depth_mask = self._project_lidar_to_depth(
+                    frame, idx, original_size
+                )
 
             # Load semantic mask (if available)
             if frame['semantic_path'] is not None and os.path.exists(frame['semantic_path']):

@@ -1,0 +1,273 @@
+defaults:
+  - default_dataset.yaml
+  - _self_
+
+# Strategy B: LoRA on Depth Head + Late Transformer Layers (Medium Strength) - 2 GPU Configuration
+# Adapts both prediction head and high-level transformer features with 2 GPUs (RTX 5090 + RTX 3090 Ti).
+exp_name: lora_kitti360_strategy_b_r16_2gpu
+
+img_size: 518
+num_workers: 8
+seed_value: 42
+accum_steps: 3           # Adjusted from 5 to maintain effective batch size with 2 GPUs
+patch_size: 14
+val_epoch_freq: 2
+max_img_per_gpu: 64       # Keep same per-GPU batch size
+
+# Effective batch size calculation:
+# Single GPU: 64 / 8 * 1 * 5 = 40 sequences
+# 2 GPUs:     64 / 8 * 2 * 3 = 48 sequences (slightly larger, acceptable range)
+# Note: Exact replication of single-GPU training is not guaranteed due to DDP synchronization
+
+limit_train_batches: 500
+limit_val_batches: 50
+
+# LoRA configuration (unchanged)
+lora:
+  enabled: True
+  rank: 16
+  alpha: 16
+  dropout: 0.1
+  target_modules:
+    - "depth_head.*"
+    - "aggregator.frame_blocks.1[6-9].*"
+    - "aggregator.frame_blocks.2[0-3].*"
+    - "aggregator.global_blocks.1[6-9].*"
+    - "aggregator.global_blocks.2[0-3].*"
+
+# KITTI-360 dataset configuration tuned for medium VRAM usage
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    shuffle: True
+    pin_memory: True
+    prefetch_factor: 1
+    persistent_workers: True
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      debug: False
+      repeat_batch: False
+      training: True
+      inside_random: True
+      rescale: True
+      rescale_aug: True
+      landscape_check: False
+      load_depth: True
+      get_nearby: False
+      load_track: False
+      track_num: 256
+      fix_img_num: -1
+      fix_aspect_ratio: 1.0
+      allow_duplicate_img: False
+      img_nums: [8, 8]
+      augs:
+        scales: null
+        aspects: [1.0, 1.0]
+        cojitter: False
+        cojitter_ratio: 0.3
+        color_jitter: null
+        gray_scale: False
+        gau_blur: False
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.kitti360.KITTI360Dataset
+          root_dir: /home/zerun/data/dataset/KITTI-360
+          split: train
+          camera_id: 0
+          sampling_strategy: adaptive
+          building_sampling_weights: [0.5, 0.3, 0.2]
+          accumulation_frames: 4
+          min_valid_points: 2000
+          semantic_weight_enabled: True
+          filter_buildings_only: False
+          depth_range: [0.1, 80.0]
+          len_train: 50000
+          len_test: 5000
+          use_precomputed: True
+          precomputed_dir: null
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: 4
+    max_img_per_gpu: ${max_img_per_gpu}
+    shuffle: False
+    pin_memory: True
+    prefetch_factor: 2
+    persistent_workers: False
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      debug: False
+      repeat_batch: False
+      training: False
+      inside_random: False
+      rescale: True
+      rescale_aug: False
+      landscape_check: False
+      load_depth: True
+      get_nearby: False
+      load_track: False
+      track_num: 256
+      fix_img_num: -1
+      fix_aspect_ratio: 1.0
+      allow_duplicate_img: False
+      img_nums: [8, 8]
+      augs:
+        scales: null
+        aspects: [1.0, 1.0]
+        cojitter: False
+        cojitter_ratio: 0.5
+        color_jitter: null
+        gray_scale: False
+        gau_blur: False
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.kitti360.KITTI360Dataset
+          root_dir: /home/zerun/data/dataset/KITTI-360
+          split: val
+          camera_id: 0
+          sampling_strategy: adaptive
+          building_sampling_weights: [0.5, 0.3, 0.2]
+          accumulation_frames: 4
+          min_valid_points: 2000
+          semantic_weight_enabled: True
+          filter_buildings_only: False
+          depth_range: [0.1, 80.0]
+          len_train: 50000
+          len_test: 5000
+          use_precomputed: True
+          precomputed_dir: null
+
+logging:
+  log_dir: logs/${exp_name}
+  log_visuals: False
+  log_freq: 1
+  log_level_primary: DEBUG
+  log_level_secondary: WARNING
+  all_ranks: False
+  tensorboard_writer:
+    _target_: train_utils.tb_writer.TensorBoardLogger
+    path: ${logging.log_dir}/tensorboard
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_camera
+        - loss_T
+        - loss_R
+        - loss_FL
+        - loss_conf_depth
+        - loss_reg_depth
+        - loss_grad_depth
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_camera
+        - loss_T
+        - loss_R
+        - loss_FL
+        - loss_conf_depth
+        - loss_reg_depth
+        - loss_grad_depth
+
+checkpoint:
+  save_dir: logs/${exp_name}/ckpts
+  save_freq: 1
+  resume_checkpoint_path: ./pretrained/vggt-1b/model.pt
+  strict: False
+  enabled: true
+
+loss:
+  _target_: loss.MultitaskLoss
+  camera:
+    weight: 2.0
+    loss_type: "l1"
+  depth:
+    weight: 5.0
+    gradient_loss_fn: "grad"
+    valid_range: 0.99
+    use_semantic_weighting: True
+    facade_boost_ratio: 0.4
+  point: null
+  track: null
+
+optim:
+  param_group_modifiers: False
+  param_groups:
+    zero_weight_decay:
+      bias: True
+      norm: True
+      lora: True
+      patterns: []
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-5
+    weight_decay: 0.01
+
+  frozen_module_names:
+    - "*aggregator.frame_blocks.[0-9].*"
+    - "*aggregator.frame_blocks.1[0-5].*"
+    - "*aggregator.global_blocks.[0-9].*"
+    - "*aggregator.global_blocks.1[0-5].*"
+    - "*aggregator.patch_embed*"
+    - "*camera_head*"
+
+  amp:
+    enabled: True
+    amp_dtype: bfloat16
+
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["depth_head"]
+        max_norm: 0.5
+        norm_type: 2
+      - module_name: ["aggregator.frame_blocks", "aggregator.global_blocks"]
+        max_norm: 0.3
+        norm_type: 2
+
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-7
+              end_value: 1e-5
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 1e-5
+              end_value: 1e-7
+          lengths: [0.15, 0.85]
+          interval_scaling: ['rescaled', 'rescaled']
+    weight_decay:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 0.01
+
+max_epochs: 50
+
+model:
+  _target_: vggt.models.vggt.VGGT
+  enable_camera: True
+  enable_depth: True
+  enable_point: False
+  enable_track: False
+
+distributed:
+  backend: nccl
+  comms_dtype: None
+  find_unused_parameters: False
+  timeout_mins: 30
+  gradient_as_bucket_view: True
+  bucket_cap_mb: 25
+  broadcast_buffers: True
+
+cuda:
+  cudnn_deterministic: False
+  cudnn_benchmark: True
+  allow_tf32: True

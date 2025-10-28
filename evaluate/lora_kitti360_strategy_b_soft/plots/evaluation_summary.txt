@@ -1,0 +1,28 @@
+================================================================================
+KITTI-360 LoRA Training Evaluation Summary
+================================================================================
+
+Total Checkpoints Evaluated: 51
+Best Checkpoint: checkpoint_37
+Best Comprehensive Score: 0.2999
+Baseline Score: 0.2589
+Improvement: 15.81%
+
+--------------------------------------------------------------------------------
+Key Metrics Comparison (Baseline vs Best)
+--------------------------------------------------------------------------------
+Building Abs Rel Error                   | Baseline:   2.0440 | Best:   0.7886 | ↓ +61.42%
+Building δ<1.25 Accuracy                 | Baseline:   0.3822 | Best:   0.3857 | ↑  +0.90%
+Building RMSE                            | Baseline:  18.1306 | Best:  11.7445 | ↓ +35.22%
+Normal Angular Error (deg)               | Baseline:  83.7337 | Best:  81.1862 | ↓  +3.04%
+Planarity Inlier Ratio                   | Baseline:   0.1493 | Best:   0.2294 | ↑ +53.66%
+ATE Translation                          | Baseline: 3628.5294 | Best: 3639.1425 | ↓  -0.29%
+ATE Rotation (deg)                       | Baseline: 176.9661 | Best: 177.7918 | ↓  -0.47%
+
+--------------------------------------------------------------------------------
+Training Progress Notes
+--------------------------------------------------------------------------------
+• Checkpoint 19→20 transition shows significant change:
+  Building δ<1.25: 0.3591 → 0.3456 (-3.76%)
+
+================================================================================

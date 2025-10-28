@@ -19,5 +19,8 @@ export WORLD_SIZE="${WORLD_SIZE:-1}"
 export MASTER_ADDR="${MASTER_ADDR:-localhost}"
 export MASTER_PORT="${MASTER_PORT:-29500}"
 
+# Enable Flash Attention by default for better performance
+export VGGT_ENABLE_FLASH_ATTENTION="${VGGT_ENABLE_FLASH_ATTENTION:-1}"
+
 # Run training with vggt-train environment Python
 /home/zerun/miniconda3/envs/vggt-train/bin/python training/launch.py --config $CONFIG

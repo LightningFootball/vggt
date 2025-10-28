@@ -130,7 +130,6 @@ def crop_image_depth_and_intrinsic_by_pp(
     # If strict, zero-pad if the new shape is smaller than target_shape
     if strict:
         if (image.shape[:2] != target_shape).any():
-            print(f"{filepath} does not meet the target shape")
             current_h, current_w = image.shape[:2]
             target_h, target_w = target_shape[0], target_shape[1]
             pad_h = target_h - current_h
@@ -140,6 +139,15 @@ def crop_image_depth_and_intrinsic_by_pp(
                     f"The cropped image is bigger than the target shape: "
                     f"cropped=({current_h},{current_w}), "
                     f"target=({target_h},{target_w})."
+                )
+            # Only log if filepath is provided and padding is needed
+            if filepath is not None and (pad_h > 0 or pad_w > 0):
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(
+                    f"Padding required for {filepath}: "
+                    f"cropped=({current_h},{current_w}), target=({target_h},{target_w}), "
+                    f"padding=({pad_h},{pad_w})"
                 )
             image = np.pad(
                 image,

@@ -83,6 +83,8 @@ data:
           depth_range: [0.1, 80.0]
           len_train: 50000
           len_test: 5000
+          use_precomputed: True  # 🆕 Enable precomputed data loading
+          precomputed_dir: null  # 🆕 Auto-discover: <root_dir>/precomputed/vggt_lora
   val:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
     num_workers: 4
@@ -133,6 +135,8 @@ data:
           depth_range: [0.1, 80.0]
           len_train: 50000
           len_test: 5000
+          use_precomputed: True  # 🆕 Enable precomputed data loading
+          precomputed_dir: null  # 🆕 Auto-discover: <root_dir>/precomputed/vggt_lora
 
 logging:
   log_dir: logs/${exp_name}
